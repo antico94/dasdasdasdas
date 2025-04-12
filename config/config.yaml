@@ -1,0 +1,90 @@
+data:
+  lookback_days: 365
+  save_path: data/historical
+  split_ratio: 0.8
+  symbol: XAUUSD
+  timeframes:
+  - M5
+  - M15
+  - H1
+  - D1
+features:
+  external_data:
+  - name: usd_index
+    source: yfinance
+    symbol: DX-Y.NYB
+  - name: us_10y_yield
+    source: yfinance
+    symbol: ^TNX
+  technical_indicators:
+  - indicators:
+    - name: sma
+      params:
+      - 20
+      - 50
+      - 200
+    - name: ema
+      params:
+      - 9
+      - 21
+      - 55
+      - 200
+    - name: macd
+      params:
+        fast: 12
+        signal: 9
+        slow: 26
+    type: trend
+  - indicators:
+    - name: rsi
+      params:
+      - 7
+      - 14
+      - 21
+    - name: stoch
+      params:
+        d: 3
+        k: 14
+        smooth_k: 3
+    type: momentum
+  - indicators:
+    - name: bbands
+      params:
+        length: 20
+        std: 2
+    - name: atr
+      params:
+      - 14
+      - 21
+    type: volatility
+logging:
+  level: INFO
+  log_file: logs/trading_bot.log
+  log_to_file: true
+model:
+  hyperparameter_tuning: true
+  prediction_horizon: 12
+  prediction_target: direction
+  retraining_frequency: weekly
+  type: ensemble
+mt5:
+  login: 145688
+  password: "X9vyB7%90i"
+  server: FusionMarkets-Demo
+  timeout: 60000
+risk:
+  max_drawdown: 0.15
+  max_open_positions: 3
+  max_position_size: 0.02
+  stop_loss: 0.02
+  take_profit: 0.03
+strategy:
+  holding_periods:
+    max: 48
+    min: 4
+  min_confidence: 0.65
+  session_filters:
+  - active: true
+    name: low_liquidity
+    sessions:
+    - asian
