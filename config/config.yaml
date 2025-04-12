@@ -63,7 +63,7 @@ logging:
   log_to_file: true
 model:
   hyperparameter_tuning: true
-  prediction_horizon: 12
+  prediction_horizon: 6
   prediction_target: direction
   retraining_frequency: weekly
   type: ensemble
@@ -82,9 +82,9 @@ strategy:
   holding_periods:
     max: 48
     min: 4
-  min_confidence: 0.65
+  min_confidence: 0.55
   session_filters:
-  - active: true
+  - active: false
     name: low_liquidity
     sessions:
     - asian

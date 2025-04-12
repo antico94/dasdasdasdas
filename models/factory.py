@@ -1,46 +1,148 @@
-from typing import Dict, Optional, Type
+import joblib
+from typing import Any, Dict, Union
+import os
+from utils.logger import setup_logger
 
-from config.constants import ModelType
-from models.base import BaseModel
-from models.random_forest import RandomForestModel
-from models.xgboost_model import XGBoostModel
-from models.lstm_model import LSTMModel
-from models.ensemble_model import EnsembleModel
+logger = setup_logger("ModelFactory")
 
 
 class ModelFactory:
-    """Factory for creating model instances."""
+    @staticmethod
+    def load_model(model_path: str):
+        """Load a trained model from a joblib file, handling different storage structures."""
+        logger.info(f"Loading model from {model_path}")
 
-    MODEL_REGISTRY = {
-        ModelType.RANDOM_FOREST.value: RandomForestModel,
-        ModelType.XGBOOST.value: XGBoostModel,
-        ModelType.LSTM.value: LSTMModel,
-        ModelType.ENSEMBLE.value: EnsembleModel
-    }
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file not found: {model_path}")
 
-    @classmethod
-    def create_model(cls, model_type: str, config: Dict) -> BaseModel:
-        """Create a model instance of the specified type."""
-        if model_type not in cls.MODEL_REGISTRY:
-            raise ValueError(f"Unknown model type: {model_type}")
+        model = joblib.load(model_path)
+        logger.info(f"Loaded object type: {type(model)}")
 
-        model_class = cls.MODEL_REGISTRY[model_type]
-        return model_class(config)
+        # If the model is a dictionary, check if it's an ensemble model metadata
+        if isinstance(model, dict):
+            logger.info(f"Model is a dictionary with keys: {model.keys()}")
 
-    @classmethod
-    def load_model(cls, model_path: str, model_type: Optional[str] = None) -> BaseModel:
-        """Load a model from file."""
-        if model_type is None:
-            # Infer model type from filename
-            if "random_forest" in model_path:
-                model_type = ModelType.RANDOM_FOREST.value
-            elif "xgboost" in model_path:
-                model_type = ModelType.XGBOOST.value
-            elif "lstm" in model_path:
-                model_type = ModelType.LSTM.value
-            else:
-                model_type = ModelType.ENSEMBLE.value
+            # Check if this is an EnsembleModel metadata dictionary
+            if 'is_classifier' in model and 'sub_model_paths' in model:
+                logger.info("Detected EnsembleModel metadata format")
 
-        model = cls.create_model(model_type, {})
-        model.load(model_path)
+                # Import here to avoid circular imports
+                from models.ensemble_model import EnsembleModel
+
+                # Create empty EnsembleModel and load using its own load method
+                ensemble_model = EnsembleModel({})
+                ensemble_model.load(model_path)
+
+                logger.info("Successfully loaded EnsembleModel")
+                return ensemble_model
+
+            # Common keys in model dictionaries for other formats
+            model_keys = ['model', 'ensemble', 'classifier', 'regressor', 'rf_model', 'xgb_model']
+
+            # Try to find the main model
+            main_model = None
+            for key in model_keys:
+                if key in model:
+                    main_model = model[key]
+                    logger.info(f"Found model object under key '{key}': {type(main_model)}")
+                    break
+
+            # If no main model found, create an EnsembleWrapper for prediction
+            if main_model is None:
+                logger.info("Creating EnsembleWrapper for dictionary model")
+                return EnsembleWrapper(model)
+
+            return main_model
+
+        # Return the model as is if it's not a dictionary
         return model
+
+
+class EnsembleWrapper:
+    """Wrapper for ensemble models stored as dictionaries."""
+
+    def __init__(self, model_dict: Dict):
+        self.model_dict = model_dict
+        self.logger = setup_logger("EnsembleWrapper")
+        self.logger.info(f"Initializing EnsembleWrapper with models: {list(model_dict.keys())}")
+
+        # Extract component models
+        self.component_models = {}
+        for key, value in model_dict.items():
+            if hasattr(value, 'predict') or hasattr(value, 'predict_proba'):
+                self.component_models[key] = value
+
+        self.logger.info(f"Found {len(self.component_models)} usable component models")
+
+        # Determine if we're dealing with classifiers or regressors
+        self.is_classifier = any(hasattr(model, 'predict_proba') for model in self.component_models.values())
+        self.logger.info(f"Ensemble is a {'classifier' if self.is_classifier else 'regressor'}")
+
+    def predict(self, X):
+        """Aggregate predictions from component models."""
+        if not self.component_models:
+            raise ValueError("No usable component models found in ensemble")
+
+        predictions = {}
+
+        for name, model in self.component_models.items():
+            try:
+                predictions[name] = model.predict(X)
+            except Exception as e:
+                self.logger.error(f"Error predicting with {name}: {str(e)}")
+
+        if not predictions:
+            raise ValueError("All component models failed to generate predictions")
+
+        # Simple averaging for regression or voting for classification
+        if self.is_classifier:
+            # Majority vote
+            import numpy as np
+            all_preds = np.array(list(predictions.values()))
+            return np.apply_along_axis(lambda x: np.bincount(x).argmax(), axis=0, arr=all_preds)
+        else:
+            # Average regression predictions
+            import numpy as np
+            return np.mean(list(predictions.values()), axis=0)
+
+    def predict_proba(self, X):
+        """Aggregate probability predictions from component models."""
+        if not self.is_classifier:
+            raise ValueError("predict_proba is only available for classifier ensembles")
+
+        proba_predictions = {}
+
+        for name, model in self.component_models.items():
+            if hasattr(model, 'predict_proba'):
+                try:
+                    proba_predictions[name] = model.predict_proba(X)
+                except Exception as e:
+                    self.logger.error(f"Error predicting probabilities with {name}: {str(e)}")
+
+        if not proba_predictions:
+            raise ValueError("No probability predictions generated by component models")
+
+        # Average probabilities
+        import numpy as np
+        all_probas = np.array(list(proba_predictions.values()))
+        return np.mean(all_probas, axis=0)
+
+    def get_feature_importance(self):
+        """Aggregate feature importance from component models."""
+        feature_importance = {}
+
+        for name, model in self.component_models.items():
+            if hasattr(model, 'feature_importances_'):
+                # Extract feature names if available
+                if hasattr(model, 'feature_names_in_'):
+                    features = model.feature_names_in_
+                else:
+                    features = [f"feature_{i}" for i in range(len(model.feature_importances_))]
+
+                # Add to dictionary
+                for feature, importance in zip(features, model.feature_importances_):
+                    if feature not in feature_importance:
+                        feature_importance[feature] = 0
+                    feature_importance[feature] += importance / len(self.component_models)
+
+        return feature_importance

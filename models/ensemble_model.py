@@ -92,38 +92,55 @@ class EnsembleModel(BaseModel):
         # Combine feature importances from sub-models
         self._combine_feature_importances(X_train.columns)
 
+    def predict_direct(self, X):
+        """Make predictions directly using sub-models, bypassing the VotingClassifier."""
+        predictions = []
+
+        for name, model in self.fitted_sub_models:
+            try:
+                pred = model.predict(X)
+                predictions.append(pred)
+            except Exception as e:
+                print(f"Error predicting with {name}: {str(e)}")
+
+        if not predictions:
+            raise ValueError("No predictions generated from sub-models")
+
+        # Average predictions
+        return np.mean(predictions, axis=0).round().astype(int)
+
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         """Make predictions using the ensemble model."""
         if not self.is_fitted:
             raise ValueError("Model is not fitted yet. Call fit() first.")
 
-        # If we have only LSTM, return its predictions
-        if self.lstm_model is not None and not self.fitted_sub_models:
-            return self.lstm_model.predict(X)
+        try:
+            # Try using the standard model
+            if self.model is not None:
+                return self.model.predict(X)
+        except Exception as e:
+            print(f"Error using standard predict: {str(e)}")
 
-        # If we have only scikit-learn models, return ensemble predictions
-        if not self.lstm_model and self.fitted_sub_models:
-            return self.model.predict(X)
+        # Fall back to direct prediction
+        return self.predict_direct(X)
 
-        # If we have both, combine predictions
-        if self.lstm_model and self.fitted_sub_models:
-            # Get predictions from each model type
-            assert self.lstm_model is not None
-            lstm_preds = self.lstm_model.predict(X)
-            ensemble_preds = self.model.predict(X)
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        """Return prediction probabilities for classification models."""
+        if not self.is_fitted:
+            raise ValueError("Model is not fitted yet. Call fit() first.")
 
-            # Handle NaN values from LSTM padding
-            lstm_preds_clean = np.copy(lstm_preds)
-            nan_mask = np.isnan(lstm_preds)
-            lstm_preds_clean[nan_mask] = ensemble_preds[nan_mask]
+        if not self.is_classifier:
+            raise ValueError("predict_proba() is only available for classification models.")
 
-            # For classifier, we need to ensure consistent label types
-            if self.is_classifier:
-                return lstm_preds_clean.astype(int)
-            else:
-                return lstm_preds_clean
+        try:
+            # Try using the standard model
+            if self.model is not None:
+                return self.model.predict_proba(X)
+        except Exception as e:
+            print(f"Error using standard predict_proba: {str(e)}")
 
-        raise ValueError("No models available for prediction.")
+        # Fall back to direct prediction
+        return self.predict_proba_direct(X)
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         """Return prediction probabilities for classification models."""
@@ -240,6 +257,8 @@ class EnsembleModel(BaseModel):
     def load(self, filepath: str) -> None:
         """Load the ensemble model from disk."""
         import joblib
+        import numpy as np
+        from sklearn.preprocessing import LabelEncoder
 
         # Load metadata
         save_dict = joblib.load(filepath)
@@ -253,6 +272,8 @@ class EnsembleModel(BaseModel):
 
         # Load sub-models
         self.fitted_sub_models = []
+        self.sub_models = []
+
         for name, path in save_dict['sub_model_paths'].items():
             if name == 'lstm':
                 self.lstm_model = LSTMModel({})  # Empty config as we're loading a fitted model
@@ -261,10 +282,12 @@ class EnsembleModel(BaseModel):
                 model = RandomForestModel({})
                 model.load(path)
                 self.fitted_sub_models.append((name, model))
+                self.sub_models.append((name, model))
             elif name == 'xgboost':
                 model = XGBoostModel({})
                 model.load(path)
                 self.fitted_sub_models.append((name, model))
+                self.sub_models.append((name, model))
 
         # Recreate ensemble model if scikit-learn models exist
         if self.fitted_sub_models:
@@ -274,11 +297,25 @@ class EnsembleModel(BaseModel):
                     voting='soft',
                     weights=self.model_weights
                 )
+
+                # Important: Mark the VotingClassifier as fitted
+                self.model.estimators_ = [model.model for _, model in self.fitted_sub_models]
+                self.model.named_estimators_ = {name: model.model for name, model in self.fitted_sub_models}
+
+                # Create and fit a dummy label encoder for binary classification
+                le = LabelEncoder()
+                le.classes_ = np.array([0, 1])
+                self.model.le_ = le
+                self.model.classes_ = np.array([0, 1])
             else:
                 self.model = VotingRegressor(
                     estimators=[(name, model.model) for name, model in self.fitted_sub_models],
                     weights=self.model_weights
                 )
+
+                # Important: Mark the VotingRegressor as fitted
+                self.model.estimators_ = [model.model for _, model in self.fitted_sub_models]
+                self.model.named_estimators_ = {name: model.model for name, model in self.fitted_sub_models}
 
     def get_hyperparameters(self) -> Dict:
         """Get hyperparameters from all sub-models."""
