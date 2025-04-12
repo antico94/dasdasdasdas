@@ -125,6 +125,19 @@ def analyze_model(model_path, timeframe='H1', confidence_threshold=0.65):
                 above_threshold = (positive_probs >= confidence_threshold).sum()
                 below_threshold = (positive_probs <= (1 - confidence_threshold)).sum()
 
+                # Test lower confidence thresholds
+                if is_classifier and confidence_threshold > 0.5:
+                    logger.info("Testing lower confidence thresholds:")
+                    for test_threshold in [0.6, 0.55, 0.5]:
+                        test_buy_signals = (positive_probs >= test_threshold).sum()
+                        test_sell_signals = (positive_probs <= (1 - test_threshold)).sum()
+                        test_total_signals = test_buy_signals + test_sell_signals
+                        logger.info(f"With threshold {test_threshold}:")
+                        logger.info(
+                            f"  Buy signals: {test_buy_signals}/{len(positive_probs)} ({test_buy_signals / len(positive_probs) * 100:.1f}%)")
+                        logger.info(
+                            f"  Sell signals: {test_sell_signals}/{len(positive_probs)} ({test_sell_signals / len(positive_probs) * 100:.1f}%)")
+
                 logger.info(f"Confidence threshold: {confidence_threshold}")
                 logger.info(
                     f"Predictions above buy threshold: {above_threshold} ({above_threshold / len(positive_probs) * 100:.1f}%)")

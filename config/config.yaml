@@ -82,7 +82,7 @@ strategy:
   holding_periods:
     max: 48
     min: 4
-  min_confidence: 0.55
+  min_confidence: 0.5
   session_filters:
   - active: false
     name: low_liquidity
