@@ -517,9 +517,12 @@ def backtest_model(
                 test_results['pred_probability'] = positive_probs
 
                 # Generate trading signals based on probabilities
+                test_results['pred_probability_up'] = positive_probs  # Column 1 (up probability)
+                test_results['pred_probability_down'] = 1 - positive_probs  # Column 0 (down probability)
                 test_results['signal'] = np.zeros(len(test_results))
-                test_results.loc[test_results['pred_probability'] >= confidence_threshold, 'signal'] = 1  # Buy
-                test_results.loc[test_results['pred_probability'] <= (1 - confidence_threshold), 'signal'] = -1  # Sell
+                test_results.loc[test_results[
+                                     'pred_probability_down'] >= confidence_threshold, 'signal'] = 1  # BUY when model thinks down
+                test_results.loc[test_results['pred_probability_up'] >= confidence_threshold, 'signal'] = -1
 
                 logger.info(f"Generated {(test_results['signal'] != 0).sum()} trading signals")
                 logger.info(f"Buy signals: {(test_results['signal'] == 1).sum()}")
@@ -601,7 +604,10 @@ def backtest_model(
 
         if action == TradeAction.BUY.value:
             # Calculate position size based on risk
-            position_size = (balance * risk_per_trade) / (current_price * 0.01)  # Assuming 1% stop loss
+            stop_loss_pips = 100  # Defined stop loss in pips
+            max_risk_amount = balance * risk_per_trade
+            position_size = max_risk_amount / (stop_loss_pips * point_value)
+            position_size = min(position_size, balance / current_price * 0.5)
             entry_price = current_price + (spread_points + slippage_points) * point_value
             position = 1
 
@@ -643,6 +649,10 @@ def backtest_model(
                 exit_price = current_price + (spread_points + slippage_points) * point_value
                 profit_loss = (entry_price - exit_price) * position_size
 
+            max_loss = -initial_balance * 0.05  # Limit loss to 5% of initial balance per trade
+            if profit_loss < max_loss:
+                logger.warning(f"Limiting loss at {idx} from {profit_loss:.2f} to {max_loss:.2f}")
+                profit_loss = max_loss
             # Update balance
             balance += profit_loss
             test_results.at[idx, 'profit_loss'] = profit_loss
