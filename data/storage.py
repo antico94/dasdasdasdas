@@ -10,12 +10,39 @@ import yaml
 
 
 class DataStorage:
-    def __init__(self, config_path: str = "config/config.yaml"):
+    def __init__(self, config_path: Optional[str] = None):
+        # Use pathlib to compute the project root robustly.
+        # __file__ is the path to this file (should be .../GoldML/data/storage.py)
+        current_file = Path(__file__).resolve()
+        # project_root should be one level above the 'data' folder:
+        project_root = current_file.parents[1]  # This yields .../GoldML
+
+        # If no config_path is provided, use the computed project root.
+        if config_path is None:
+            config_path = project_root / "config" / "config.yaml"
+        else:
+            config_path = Path(config_path)
+
+        # Debug log the computed config path (you can print or log it)
+        print(f"DEBUG: Attempting to load config from: {config_path}")
+
+        if not config_path.exists():
+            raise FileNotFoundError(f"Configuration file not found at {config_path}")
+
+        # Load the configuration from YAML.
         with open(config_path, "r") as file:
             self.config = yaml.safe_load(file)
 
-        self.base_path = self.config["data"]["save_path"]
+        # Convert the save_path (from config) to an absolute path, assuming it's relative to the project root.
+        save_path = self.config["data"]["save_path"]
+        save_path = Path(save_path)
+        if not save_path.is_absolute():
+            self.base_path = project_root / save_path
+        else:
+            self.base_path = save_path
+
         os.makedirs(self.base_path, exist_ok=True)
+
 
     def save_dataframe(
             self,

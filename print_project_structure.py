@@ -1,7 +1,7 @@
 import os
 
 # Folders to ignore
-IGNORE_DIRS = {'.venv', '__pycache__', '.git', '.idea', 'print_project_structure.py'}
+IGNORE_DIRS = {'.venv', '__pycache__', '.git', '.idea', 'print_project_structure.py', 'analysis'}
 
 
 def build_tree(start_path='.', indent=''):

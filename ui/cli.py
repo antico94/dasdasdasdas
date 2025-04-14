@@ -147,7 +147,7 @@ class TradingBotCLI:
             'indicator_types': ['trend', 'momentum', 'volatility', 'volume', 'support_resistance', 'custom'],
             'normalization': 'standard',
             'target_type': 'direction',
-            'prediction_horizon': 12,
+            'prediction_horizon': 1,
             'train_test_split': 0.8
         }
 
@@ -468,19 +468,25 @@ class TradingBotCLI:
 
     def _get_available_models(self) -> List[Choice]:
         """Get list of available trained models."""
-        # Determine the project root based on the location of this file.
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        models_dir = os.path.join(project_root, "models")
+        models_dir = os.path.join(project_root, "data", "models")
 
         if not os.path.exists(models_dir):
             return []  # Return empty list if no models directory is found
 
         model_files = [f for f in os.listdir(models_dir) if f.endswith('.joblib')]
 
-        if not model_files:
+        # Verify files actually exist
+        verified_files = []
+        for f in model_files:
+            full_path = os.path.join(models_dir, f)
+            if os.path.isfile(full_path):
+                verified_files.append(f)
+
+        if not verified_files:
             return []  # Return empty list if no model files are present
 
-        return [Choice(f, os.path.join(models_dir, f)) for f in model_files]
+        return [Choice(f, os.path.join(models_dir, f)) for f in verified_files]
 
     def confirm_action(self, action: str) -> bool:
         """Confirm an action with the user."""

@@ -1,322 +1,430 @@
 import os
-import sys
 import time
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Union, Any
 
+import joblib
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, classification_report
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import xgboost as xgb
 
 from config.constants import ModelType, PredictionTarget
 from data.processor import DataProcessor
 from data.storage import DataStorage
 from models.feature_selection import FeatureSelector
-from models.base import BaseModel
-from models.random_forest import RandomForestModel
-from models.xgboost_model import XGBoostModel
-from models.lstm_model import LSTMModel
-from models.ensemble_model import EnsembleModel
 from utils.logger import setup_logger
 
-class ModelTrainer:
-    def __init__(self, config: Dict):
-        self.config = config
-        self.model_type = config.get('model', {}).get('type', ModelType.ENSEMBLE.value)
-        self.target_type = config.get('model', {}).get('prediction_target', PredictionTarget.DIRECTION.value)
-        self.use_feature_selection = config.get('model', {}).get('feature_selection', True)
-        self.use_cross_validation = config.get('model', {}).get('cross_validation', True)
-        self.feature_selector = FeatureSelector(config)
-        # Initialize logger for this class
-        self.logger = setup_logger(name="ModelTrainerLogger")
-        self.logger.debug("Initialized ModelTrainer with model_type: %s, target_type: %s, feature_selection: %s",
-                            self.model_type, self.target_type, self.use_feature_selection)
-
-    def create_model(self) -> BaseModel:
-        """Create a model based on configuration."""
-        if self.model_type == ModelType.RANDOM_FOREST.value:
-            return RandomForestModel(self.config)
-        elif self.model_type == ModelType.XGBOOST.value:
-            return XGBoostModel(self.config)
-        elif self.model_type == ModelType.LSTM.value:
-            return LSTMModel(self.config)
-        elif self.model_type == ModelType.ENSEMBLE.value:
-            return EnsembleModel(self.config)
-        else:
-            raise ValueError(f"Unknown model type: {self.model_type}")
-
-    def train_model(
-            self,
-            X_train: pd.DataFrame,
-            y_train: pd.Series,
-            X_val: Optional[pd.DataFrame] = None,
-            y_val: Optional[pd.Series] = None,
-            selected_features: Optional[List[str]] = None
-    ) -> Tuple[BaseModel, Dict[str, Any]]:
-        """Train model and return model and metrics."""
-        start_time = time.time()
-
-        # Instead of performing feature selection, always use all available features.
-        if selected_features is None:
-            self.logger.info("Skipping feature selection; using all available features.")
-            selected_features = X_train.columns.tolist()
-        else:
-            self.logger.info("Using provided feature list.")
-
-        # Filter training (and validation) data to use all these features.
-        original_columns = X_train.columns.tolist()
-        X_train = X_train[selected_features]
-        if X_val is not None:
-            X_val = X_val[selected_features]
-        self.logger.debug("Filtered training features. Original columns: %s", original_columns)
-        self.logger.debug("Using columns for training: %s", selected_features)
-        self.logger.debug("Training data shape: %s", X_train.shape)
-
-        # Create and train model
-        model = self.create_model()
-        self.logger.info("Training model with %d samples and %d features", X_train.shape[0], X_train.shape[1])
-        model.fit(X_train, y_train, X_val, y_val)
-
-        # Evaluate model on training data and (if available) on validation data.
-        train_metrics = self.evaluate_model(model, X_train, y_train, "train")
-        val_metrics = {}
-        if X_val is not None and y_val is not None:
-            val_metrics = self.evaluate_model(model, X_val, y_val, "val")
-
-        metrics = {
-            "train": train_metrics,
-            "val": val_metrics,
-            "training_time": time.time() - start_time,
-            "n_features": X_train.shape[1],
-            "n_samples": X_train.shape[0],
-            "feature_importance": model.get_feature_importance(),
-            "selected_features": selected_features
-        }
-        self.logger.info("Completed training in %.2f seconds using %d features", metrics["training_time"],
-                         metrics["n_features"])
-        return model, metrics
-
-    def train_with_cross_validation(
-            self,
-            X: pd.DataFrame,
-            y: pd.Series,
-            n_splits: int = 5
-    ) -> Tuple[BaseModel, Dict[str, Any]]:
-        """Train model with time series cross-validation."""
-        # If cross-validation is disabled, simply split the data into training and validation.
-        if not self.use_cross_validation:
-            split_idx = int(len(X) * 0.8)
-            X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
-            y_train, y_val = y.iloc[:split_idx], y.iloc[split_idx:]
-            return self.train_model(X_train, y_train, X_val, y_val)
-
-        # For cross-validation, we now skip feature selection on the full dataset.
-        self.logger.info("Skipping feature selection on full dataset; using all features.")
-        selected_features = X.columns.tolist()
-        # Ensure X is filtered (even though it should already contain all columns)
-        X = X[selected_features]
-        self.logger.debug("Features used for cross-validation: %s", selected_features)
-
-        fold_metrics = []
-        final_model = None
-        final_train_idx = None
-        final_val_idx = None
-
-        from sklearn.model_selection import TimeSeriesSplit
-        cv = TimeSeriesSplit(n_splits=n_splits)
-
-        for i, (train_idx, val_idx) in enumerate(cv.split(X)):
-            self.logger.info("Training fold %d/%d", i + 1, n_splits)
-            X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
-
-            # In each fold, use all features
-            model, metrics = self.train_model(X_train, y_train, X_val, y_val, selected_features)
-            fold_metrics.append(metrics)
-
-            # Save the last fold's model to be used as final model
-            if i == n_splits - 1:
-                final_model = model
-                final_train_idx = train_idx
-                final_val_idx = val_idx
-
-        avg_metrics = self._average_metrics(fold_metrics)
-        avg_metrics["final_model"] = {
-            "train_size": len(final_train_idx),
-            "val_size": len(final_val_idx),
-            "feature_importance": final_model.get_feature_importance(),
-            "selected_features": selected_features
-        }
-        self.logger.info("Completed cross-validation with %d folds", len(fold_metrics))
-        return final_model, avg_metrics
-
-    def evaluate_model(
-            self,
-            model: BaseModel,
-            X: pd.DataFrame,
-            y: pd.Series,
-            dataset: str = "test"
-    ) -> Dict[str, float]:
-        """Evaluate model performance and return metrics."""
-        y_pred = model.predict(X)
-        is_classifier = self.target_type in [
-            PredictionTarget.DIRECTION.value,
-            PredictionTarget.VOLATILITY.value
-        ]
-        metrics = {}
-
-        if is_classifier:
-            mask = ~np.isnan(y_pred)
-            if not all(mask):
-                y_pred = y_pred[mask]
-                y_true = y.iloc[mask] if isinstance(y, pd.Series) else y[mask]
-            else:
-                y_true = y
-
-            metrics = {
-                f"{dataset}_accuracy": accuracy_score(y_true, y_pred),
-                f"{dataset}_precision": precision_score(y_true, y_pred, zero_division=0),
-                f"{dataset}_recall": recall_score(y_true, y_pred, zero_division=0),
-                f"{dataset}_f1": f1_score(y_true, y_pred, zero_division=0)
-            }
-            y_dist = np.bincount(y_true) / len(y_true)
-            for i, val in enumerate(y_dist):
-                metrics[f"{dataset}_class_{i}_pct"] = val
-        else:
-            mask = ~np.isnan(y_pred)
-            if not all(mask):
-                y_pred = y_pred[mask]
-                y_true = y.iloc[mask] if isinstance(y, pd.Series) else y[mask]
-            else:
-                y_true = y
-
-            metrics = {
-                f"{dataset}_mae": mean_absolute_error(y_true, y_pred),
-                f"{dataset}_mse": mean_squared_error(y_true, y_pred),
-                f"{dataset}_rmse": np.sqrt(mean_squared_error(y_true, y_pred)),
-                f"{dataset}_r2": r2_score(y_true, y_pred)
-            }
-        self.logger.debug("Evaluation metrics on %s set: %s", dataset, metrics)
-        return metrics
-
-    def _average_metrics(self, metrics_list: List[Dict]) -> Dict:
-        """Calculate average metrics across multiple runs."""
-        avg_metrics = {}
-        skip_keys = ['feature_importance', 'selected_features']
-        all_keys = set()
-        for metrics in metrics_list:
-            for key in metrics:
-                if key not in skip_keys and isinstance(metrics[key], (int, float)):
-                    all_keys.add(key)
-        for key in all_keys:
-            values = [m.get(key, 0) for m in metrics_list if key in m]
-            if values:
-                avg_metrics[key] = sum(values) / len(values)
-        avg_metrics["n_folds"] = len(metrics_list)
-        self.logger.debug("Averaged metrics: %s", avg_metrics)
-        return avg_metrics
+logger = setup_logger("ModelTrainer")
 
 
-def train_model_pipeline(config: Dict, timeframe: str) -> Tuple[BaseModel, Dict[str, Any]]:
-    """Complete pipeline for training a model using all available features."""
-    logger = setup_logger(name="TrainModelPipelineLogger")
-    logger.info("Starting training pipeline for timeframe: %s", timeframe)
+def train_model_pipeline(config: Dict, timeframe: str = "H1") -> Tuple[Any, Dict]:
+    """Complete pipeline for training an optimized model for gold trading."""
+    logger.info(f"Starting model training pipeline for {timeframe}")
+    start_time = time.time()
 
-    from data.storage import DataStorage
-    from data.processor import DataProcessor
-    storage = DataStorage(config_path="config/config.yaml")
-    processor = DataProcessor(config_path="config/config.yaml")
-
+    # Load processed data
+    storage = DataStorage()
     processed_files = storage.find_latest_processed_data()
+
     if timeframe not in processed_files:
-        raise ValueError(f"No processed data found for timeframe {timeframe}")
+        raise ValueError(f"No processed data found for {timeframe}. Run data processing first.")
 
-    data = processor.load_data({timeframe: processed_files[timeframe]})[timeframe]
-    logger.info("Loaded data with %d rows for timeframe: %s", len(data), timeframe)
+    processor = DataProcessor()
+    data_dict = processor.load_data({timeframe: processed_files[timeframe]})
+    df = data_dict[timeframe]
 
-    from config.constants import PredictionTarget
-    target = config.get('model', {}).get('prediction_target', PredictionTarget.DIRECTION.value)
-    horizon = config.get('model', {}).get('prediction_horizon', 12)
-    split_ratio = config.get('data', {}).get('split_ratio', 0.8)
+    # Check for and update prediction horizon - use 1 period
+    if 'model' in config and 'prediction_horizon' in config['model']:
+        prediction_horizon = config['model']['prediction_horizon']
+        if prediction_horizon != 1:
+            logger.info(f"Changing prediction horizon from {prediction_horizon} to 1 for better performance")
+            config['model']['prediction_horizon'] = 1
+    else:
+        if 'model' not in config:
+            config['model'] = {}
+        config['model']['prediction_horizon'] = 1
+        logger.info("Setting prediction horizon to 1 period")
 
-    target_col = f"target_{horizon}"
-    if target_col not in data.columns:
-        data = processor.create_target_variable(data, target, horizon)
-        logger.info("Created target column: %s", target_col)
+    # Prepare features and target with 1-period horizon
+    X, y = processor.prepare_ml_features(df, horizon=1)
+    logger.info(f"Prepared features shape: {X.shape}, target shape: {y.shape}")
 
-    train_size = int(len(data) * split_ratio)
-    train_data = data.iloc[:train_size]
-    test_data = data.iloc[train_size:]
-    logger.info("Data split: %d training samples and %d test samples", train_data.shape[0], test_data.shape[0])
+    # Initialize config with default values if keys don't exist
+    if 'data' not in config:
+        config['data'] = {}
+    if 'split_ratio' not in config.get('data', {}):
+        config['data']['split_ratio'] = 0.8  # Default 80/20 split
+        logger.info("Using default train/test split ratio of 0.8")
 
-    # Prepare ML features from training & test data
-    X_train, y_train = processor.prepare_ml_features(train_data, horizon)
-    X_test, y_test = processor.prepare_ml_features(test_data, horizon)
-    logger.debug("Initial training features: %s", X_train.columns.tolist())
-    logger.debug("Initial test features: %s", X_test.columns.tolist())
+    # Split data chronologically
+    train_size = int(len(X) * config["data"]["split_ratio"])
+    X_train, y_train = X.iloc[:train_size], y.iloc[:train_size]
+    X_test, y_test = X.iloc[train_size:], y.iloc[train_size:]
 
-    # Log common and extra features between training and test data
-    common_features = set(X_train.columns) & set(X_test.columns)
-    extra_in_test = set(X_test.columns) - set(X_train.columns)
-    logger.debug("Common features: %s", list(common_features))
-    if extra_in_test:
-        logger.warning("Extra features in test data: %s", list(extra_in_test))
+    # Check for class imbalance
+    train_class_balance = y_train.mean()
+    test_class_balance = y_test.mean()
+    logger.info(f"Class balance - Train: {train_class_balance:.4f}, Test: {test_class_balance:.4f}")
 
-    from models.trainer import ModelTrainer
-    trainer = ModelTrainer(config)
-    model, metrics = trainer.train_with_cross_validation(X_train, y_train)
+    # Ensure model config exists with defaults
+    if 'model' not in config:
+        config['model'] = {}
+        logger.warning("Model configuration not found, using defaults")
 
-    # Use all training features for the test set
-    selected_features = X_train.columns.tolist()
-    logger.info("Using all training features for test set: %s", selected_features)
-    logger.debug("Test features before filtering: %s", X_test.columns.tolist())
-    X_test = X_test[selected_features]
-    logger.info("Filtered test features shape: %s", X_test.shape)
-    logger.debug("Test features after filtering: %s", X_test.columns.tolist())
+    # Feature selection specifically for gold trading
+    feature_selector = FeatureSelector()
+    if config["model"].get("feature_selection", True):
+        try:
+            X_train, X_test, selected_features = feature_selector.select_features(
+                X_train, y_train, X_test, method="mutual_info"
+            )
+            logger.info(f"Selected {len(selected_features)} features: {selected_features[:10]}...")
+        except Exception as e:
+            logger.error(f"Feature selection failed: {str(e)}")
+            logger.info("Using all features")
+            selected_features = X_train.columns.tolist()
+    else:
+        selected_features = X_train.columns.tolist()
 
-    # Evaluate model on test set
-    test_metrics = trainer.evaluate_model(model, X_test, y_test, "test")
-    metrics["test"] = test_metrics
-    metrics["selected_features"] = selected_features
+    # Determine model type to use
+    model_type = config["model"].get("type", "ensemble")
 
-    from config.constants import ModelType
+    # Create and train model
+    model, metrics = train_gold_trading_model(
+        X_train, y_train, X_test, y_test,
+        model_type=model_type,
+        use_cross_validation=config["model"].get("cross_validation", True),
+        hyperparameter_tuning=config["model"].get("hyperparameter_tuning", True)
+    )
 
-    # --- Build absolute paths based on the project root ---
-    # Compute the project root relative to this file.
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # Save model and metadata
+    prediction_target = config["model"].get("prediction_target", "direction")
+    prediction_horizon = config["model"].get("prediction_horizon", 1)  # Use 1 as default now
+    model_name = f"{model_type}_{timeframe}_{prediction_target}_{prediction_horizon}"
 
-    # Save the model in an absolute "models" folder.
-    model_folder = os.path.join(project_root, "models")
-    os.makedirs(model_folder, exist_ok=True)
-    model_type = config.get('model', {}).get('type', ModelType.ENSEMBLE.value)
-    model_filename = f"{model_type}_{timeframe}_{target}_{horizon}.joblib"
-    model_filepath = os.path.join(model_folder, model_filename)
-    model.save(model_filepath)
+    metadata = {
+        "features": selected_features,
+        "metrics": metrics,
+        "config": config,
+        "trained_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "data_shape": X.shape,
+        "timeframe": timeframe,
+        "prediction_target": prediction_target,
+        "prediction_horizon": prediction_horizon
+    }
 
-    # Build an absolute path for the metrics file.
-    # Remove any existing extension from the model filename to avoid duplicates.
-    base_name = os.path.splitext(model_filename)[0]
-    metrics_filename = f"{base_name}_metrics.pkl"
-    results_folder = os.path.join(project_root, "data", "results", "models")
-    os.makedirs(results_folder, exist_ok=True)
-    metrics_filepath = os.path.join(results_folder, metrics_filename)
+    model_path = storage.save_model(model, model_name, metadata=metadata)
+    logger.info(f"Model saved to {model_path}")
 
-    storage.save_results(metrics, metrics_filepath, include_timestamp=False)
-    logger.info("Model saved to %s", model_filepath)
-    logger.info("Metrics saved to %s", metrics_filepath)
+    # Calculate training time
+    training_time = time.time() - start_time
+    metrics["training_time"] = training_time
+    metrics["n_features"] = len(selected_features)
 
-    logger.info("Model Performance:")
-    logger.info("-----------------")
-    for dataset in ["train", "val", "test"]:
-        if dataset in metrics:
-            if f"{dataset}_accuracy" in metrics[dataset]:
-                logger.info("%s Accuracy: %.4f", dataset.capitalize(), metrics[dataset][f"{dataset}_accuracy"])
-                logger.info("%s F1 Score: %.4f", dataset.capitalize(), metrics[dataset][f"{dataset}_f1"])
-            elif f"{dataset}_rmse" in metrics[dataset]:
-                logger.info("%s RMSE: %.4f", dataset.capitalize(), metrics[dataset][f"{dataset}_rmse"])
-                logger.info("%s R²: %.4f", dataset.capitalize(), metrics[dataset][f"{dataset}_r2"])
+    logger.info(f"Model training completed in {training_time:.2f} seconds")
+    logger.info(f"Test metrics: {metrics['test']}")
 
     return model, metrics
 
 
+def train_gold_trading_model(
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_test: pd.DataFrame,
+        y_test: pd.Series,
+        model_type: str = "ensemble",
+        use_cross_validation: bool = True,
+        hyperparameter_tuning: bool = True
+) -> Tuple[Any, Dict]:
+    """Train an optimized model for gold trading."""
+    logger.info(f"Training {model_type} model for gold trading")
+
+    metrics = {}
+
+    # Setup time series cross-validation if needed
+    if use_cross_validation:
+        tscv = TimeSeriesSplit(n_splits=5)
+        cv_scores = []
+
+    # Check class distribution and balance
+    class_counts = y_train.value_counts()
+    logger.info(f"Train class distribution: {class_counts}")
+
+    # Calculate appropriate class weight for imbalance
+    scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum() if (y_train == 1).sum() > 0 else 1.0
+    logger.info(f"Class weight (0:1 ratio): {scale_pos_weight:.2f}")
+
+    # Train different model types
+    if model_type == ModelType.RANDOM_FOREST.value:
+        # Gold-optimized Random Forest with parameters suitable for short-term prediction
+        model = RandomForestClassifier(
+            n_estimators=200,
+            max_depth=8,  # Reduced from 10 for less overfitting on short-term
+            min_samples_split=20,
+            min_samples_leaf=15,  # Increased for better generalization
+            max_features='sqrt',
+            bootstrap=True,
+            class_weight='balanced',
+            random_state=42,
+            n_jobs=-1
+        )
+
+        if hyperparameter_tuning:
+            from sklearn.model_selection import GridSearchCV
+            logger.info("Performing hyperparameter tuning for RandomForest")
+
+            param_grid = {
+                'n_estimators': [100, 200],
+                'max_depth': [5, 8],
+                'min_samples_split': [10, 20],
+                'min_samples_leaf': [10, 15]
+            }
+
+            if use_cross_validation:
+                grid_search = GridSearchCV(
+                    estimator=model,
+                    param_grid=param_grid,
+                    cv=tscv,
+                    scoring='f1',
+                    n_jobs=-1,
+                    verbose=1
+                )
+                grid_search.fit(X_train, y_train)
+                model = grid_search.best_estimator_
+                logger.info(f"Best parameters: {grid_search.best_params_}")
+                metrics['cv_scores'] = grid_search.cv_results_
+            else:
+                # Simplified parameter search
+                best_score = 0
+                best_params = None
+
+                for n_est in param_grid['n_estimators']:
+                    for depth in param_grid['max_depth']:
+                        model = RandomForestClassifier(
+                            n_estimators=n_est,
+                            max_depth=depth,
+                            min_samples_split=20,
+                            min_samples_leaf=15,
+                            class_weight='balanced',
+                            random_state=42,
+                            n_jobs=-1
+                        )
+                        model.fit(X_train, y_train)
+                        y_pred = model.predict(X_test)
+                        f1 = f1_score(y_test, y_pred)
+
+                        if f1 > best_score:
+                            best_score = f1
+                            best_params = {
+                                'n_estimators': n_est,
+                                'max_depth': depth,
+                                'min_samples_split': 20,
+                                'min_samples_leaf': 15
+                            }
+
+                logger.info(f"Best parameters: {best_params}")
+                model = RandomForestClassifier(
+                    **best_params,
+                    class_weight='balanced',
+                    random_state=42,
+                    n_jobs=-1
+                )
+
+        # Final training with best parameters
+        model.fit(X_train, y_train)
+
+    elif model_type == ModelType.XGBOOST.value:
+        # Gold-optimized XGBoost with parameters for 1-period ahead prediction
+        model = xgb.XGBClassifier(
+            n_estimators=100,  # Reduced for 1-period prediction
+            max_depth=4,  # Reduced for less overfitting
+            learning_rate=0.1,  # Faster learning for short-term patterns
+            subsample=0.8,
+            colsample_bytree=0.8,
+            min_child_weight=10,  # More conservative for financial data
+            gamma=1,
+            scale_pos_weight=scale_pos_weight,
+            use_label_encoder=False,  # Avoid warning
+            eval_metric='logloss',  # Binary classification metric
+            random_state=42,
+            n_jobs=-1
+        )
+
+        if hyperparameter_tuning:
+            from sklearn.model_selection import GridSearchCV
+            logger.info("Performing hyperparameter tuning for XGBoost")
+
+            param_grid = {
+                'n_estimators': [50, 100],
+                'max_depth': [3, 4, 6],
+                'learning_rate': [0.05, 0.1],
+                'min_child_weight': [5, 10]
+            }
+
+            if use_cross_validation:
+                grid_search = GridSearchCV(
+                    estimator=model,
+                    param_grid=param_grid,
+                    cv=tscv,
+                    scoring='f1',
+                    n_jobs=-1,
+                    verbose=1
+                )
+                grid_search.fit(X_train, y_train)
+                model = grid_search.best_estimator_
+                logger.info(f"Best parameters: {grid_search.best_params_}")
+                metrics['cv_scores'] = grid_search.cv_results_
+            else:
+                # Simple parameter search
+                best_score = 0
+                best_params = None
+
+                for n_est in param_grid['n_estimators']:
+                    for depth in param_grid['max_depth']:
+                        for lr in param_grid['learning_rate']:
+                            model = xgb.XGBClassifier(
+                                n_estimators=n_est,
+                                max_depth=depth,
+                                learning_rate=lr,
+                                subsample=0.8,
+                                min_child_weight=10,
+                                scale_pos_weight=scale_pos_weight,
+                                use_label_encoder=False,
+                                eval_metric='logloss',
+                                random_state=42,
+                                n_jobs=-1
+                            )
+                            # Use simplified fit without extra parameters
+                            model.fit(X_train, y_train)
+                            y_pred = model.predict(X_test)
+                            f1 = f1_score(y_test, y_pred)
+
+                            if f1 > best_score:
+                                best_score = f1
+                                best_params = {
+                                    'n_estimators': n_est,
+                                    'max_depth': depth,
+                                    'learning_rate': lr,
+                                    'subsample': 0.8,
+                                    'min_child_weight': 10
+                                }
+
+                logger.info(f"Best parameters: {best_params}")
+                best_params['scale_pos_weight'] = scale_pos_weight
+                best_params['use_label_encoder'] = False
+                best_params['eval_metric'] = 'logloss'
+                best_params['random_state'] = 42
+                best_params['n_jobs'] = -1
+
+                model = xgb.XGBClassifier(**best_params)
+
+        # Final training with best parameters - using simplified fit
+        model.fit(X_train, y_train)
+
+    elif model_type == ModelType.ENSEMBLE.value:
+        # Simplified ensemble approach specifically for 1-period gold prediction
+        logger.info("Training ensemble model for gold trading")
+
+        # Train Random Forest - simplified parameters for 1-period prediction
+        rf_model = RandomForestClassifier(
+            n_estimators=100,
+            max_depth=8,
+            min_samples_split=20,
+            min_samples_leaf=15,
+            class_weight='balanced',
+            random_state=42,
+            n_jobs=-1
+        )
+        rf_model.fit(X_train, y_train)
+
+        # Train XGBoost - simplified parameters for 1-period prediction
+        xgb_model = xgb.XGBClassifier(
+            n_estimators=100,
+            max_depth=4,
+            learning_rate=0.1,
+            subsample=0.8,
+            min_child_weight=10,
+            scale_pos_weight=scale_pos_weight,
+            use_label_encoder=False,
+            eval_metric='logloss',
+            random_state=42,
+            n_jobs=-1
+        )
+        # Use simplified fit without extra parameters
+        xgb_model.fit(X_train, y_train)
+
+        # Create ensemble model with weighted voting - more weight to XGBoost
+        from sklearn.ensemble import VotingClassifier
+        model = VotingClassifier(
+            estimators=[
+                ('rf', rf_model),
+                ('xgb', xgb_model)
+            ],
+            voting='soft',  # Use probability-weighted voting
+            weights=[0.3, 0.7]  # Give more weight to XGBoost for gold prediction
+        )
+        model.fit(X_train, y_train)
+
+        # Save individual models for inspection
+        storage = DataStorage()
+        timeframe = "H1"  # Default to H1 for gold
+        prediction_target = "direction"
+        prediction_horizon = 1  # Use 1-period horizon
+
+        rf_path = storage.save_model(
+            rf_model,
+            f"ensemble_{timeframe}_{prediction_target}_{prediction_horizon}_random_forest"
+        )
+        xgb_path = storage.save_model(
+            xgb_model,
+            f"ensemble_{timeframe}_{prediction_target}_{prediction_horizon}_xgboost"
+        )
+
+        logger.info(f"Saved RF model to {rf_path}")
+        logger.info(f"Saved XGB model to {xgb_path}")
+
+    else:
+        raise ValueError(f"Unsupported model type: {model_type}")
+
+    # Evaluate on test set
+    y_pred = model.predict(X_test)
+
+    # Calculate metrics
+    accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred, zero_division=0)
+    recall = recall_score(y_test, y_pred, zero_division=0)
+    f1 = f1_score(y_test, y_pred, zero_division=0)
+
+    # Get classification report for detailed metrics
+    class_report = classification_report(y_test, y_pred, output_dict=True)
+
+    # Store metrics
+    test_metrics = {
+        'test_accuracy': accuracy,
+        'test_precision': precision,
+        'test_recall': recall,
+        'test_f1': f1,
+        'classification_report': class_report
+    }
+
+    metrics['test'] = test_metrics
+
+    # Calculate metrics for training set to check for overfitting
+    y_train_pred = model.predict(X_train)
+    train_metrics = {
+        'train_accuracy': accuracy_score(y_train, y_train_pred),
+        'train_precision': precision_score(y_train, y_train_pred, zero_division=0),
+        'train_recall': recall_score(y_train, y_train_pred, zero_division=0),
+        'train_f1': f1_score(y_train, y_train_pred, zero_division=0)
+    }
+
+    metrics['train'] = train_metrics
+
+    # Check for overfitting
+    if train_metrics['train_f1'] - test_metrics['test_f1'] > 0.2:
+        logger.warning("Possible overfitting detected: large gap between train and test F1 scores")
+
+    return model, metrics

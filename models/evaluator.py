@@ -166,9 +166,10 @@ class ModelEvaluator:
         plt.tight_layout()
         plt.show()
 
-    def calculate_trading_metrics(self, results: pd.DataFrame, initial_balance: float = 10000.0,
-                                  position_size: float = 0.1, include_spread: bool = True,
-                                  include_slippage: bool = True) -> Tuple[Dict[str, Any], pd.DataFrame, List[Dict[str, Any]]]:
+    def calculate_trading_metrics(self, results: pd.DataFrame, model_path: str, timeframe: str,
+                                  initial_balance: float = 10000.0, position_size: float = 0.1,
+                                  include_spread: bool = True, include_slippage: bool = True
+                                  ) -> Tuple[Dict[str, Any], pd.DataFrame, List[Dict[str, Any]]]:
         """Calculate trading performance metrics from signals."""
         self.logger.info("Calculating trading metrics.")
         df = results.copy()
@@ -179,6 +180,7 @@ class ModelEvaluator:
         df['balance'] = initial_balance
         df['equity'] = initial_balance
 
+        # Get cost parameters
         spread_pips = self.config.get('risk', {}).get('spread_pips', 30)
         slippage_pips = self.config.get('risk', {}).get('slippage_pips', 5)
         spread_cost = spread_pips * 0.01 if include_spread else 0
@@ -186,6 +188,9 @@ class ModelEvaluator:
 
         trades = []
         active_trade = None
+        position = 0  # Local variable tracking current position (1 for long, -1 for short)
+        entry_price = 0.0
+        balance = initial_balance  # Initialize balance
 
         for i in range(1, len(df)):
             prev_idx = df.index[i - 1]
@@ -194,12 +199,12 @@ class ModelEvaluator:
             prev_position = df.loc[prev_idx, 'position']
 
             if signal == TradeAction.BUY.value and prev_position <= 0:
-                if prev_position < 0:
+                if prev_position < 0:  # If holding short, close it first
                     exit_price = df.loc[curr_idx, 'open'] + slippage_cost
                     df.loc[curr_idx, 'exit_price'] = exit_price
-                    entry_price = active_trade['entry_price']
-                    trade_return = (entry_price - exit_price) / entry_price
-                    trade_return -= spread_cost / entry_price
+                    entry_price_old = active_trade['entry_price']
+                    trade_return = (entry_price_old - exit_price) / entry_price_old
+                    trade_return -= spread_cost / entry_price_old
                     active_trade.update({
                         'exit_date': curr_idx,
                         'exit_price': exit_price,
@@ -208,10 +213,9 @@ class ModelEvaluator:
                     })
                     trades.append(active_trade)
                     active_trade = None
-
                 entry_price = df.loc[curr_idx, 'open'] + slippage_cost
                 df.loc[curr_idx, 'position'] = 1
-                df.loc[curr_idx, 'entry_price'] = entry_price
+                position = 1  # Set local position to long
                 trade_size = df.loc[prev_idx, 'balance'] * position_size
                 active_trade = {
                     'type': 'long',
@@ -219,14 +223,13 @@ class ModelEvaluator:
                     'entry_price': entry_price,
                     'size': trade_size
                 }
-
             elif signal == TradeAction.SELL.value and prev_position >= 0:
-                if prev_position > 0:
+                if prev_position > 0:  # Close long position before selling short
                     exit_price = df.loc[curr_idx, 'open'] - slippage_cost
                     df.loc[curr_idx, 'exit_price'] = exit_price
-                    entry_price = active_trade['entry_price']
-                    trade_return = (exit_price - entry_price) / entry_price
-                    trade_return -= spread_cost / entry_price
+                    entry_price_old = active_trade['entry_price']
+                    trade_return = (exit_price - entry_price_old) / entry_price_old
+                    trade_return -= spread_cost / entry_price_old
                     active_trade.update({
                         'exit_date': curr_idx,
                         'exit_price': exit_price,
@@ -235,10 +238,9 @@ class ModelEvaluator:
                     })
                     trades.append(active_trade)
                     active_trade = None
-
                 entry_price = df.loc[curr_idx, 'open'] - slippage_cost
                 df.loc[curr_idx, 'position'] = -1
-                df.loc[curr_idx, 'entry_price'] = entry_price
+                position = -1  # Set local position to short
                 trade_size = df.loc[prev_idx, 'balance'] * position_size
                 active_trade = {
                     'type': 'short',
@@ -246,74 +248,141 @@ class ModelEvaluator:
                     'entry_price': entry_price,
                     'size': trade_size
                 }
+            elif signal == TradeAction.CLOSE.value:
+                exit_price = df.loc[curr_idx, 'open']
+                if position == 1:  # Closing long position
+                    exit_price = df.loc[curr_idx, 'open'] - slippage_cost
+                    profit_loss = (exit_price - entry_price) * active_trade['size']
+                else:  # Closing short position
+                    exit_price = df.loc[curr_idx, 'open'] + slippage_cost
+                    profit_loss = (entry_price - exit_price) * active_trade['size']
+                max_loss = -initial_balance * 0.05  # Limit loss to 5% of initial balance per trade
+                if profit_loss < max_loss:
+                    self.logger.warning(f"Limiting loss at {curr_idx} from {profit_loss:.2f} to {max_loss:.2f}")
+                    profit_loss = max_loss
+                balance += profit_loss
+                df.loc[curr_idx, 'profit_loss'] = profit_loss
+                trades.append({
+                    'time': curr_idx,
+                    'action': 'CLOSE',
+                    'price': exit_price,
+                    'size': active_trade['size'],
+                    'profit_loss': profit_loss,
+                    'balance': balance
+                })
+                active_trade = None
+                position = 0  # Reset position
+                entry_price = 0.0
+            df.loc[curr_idx, 'balance'] = balance
+            df.loc[curr_idx, 'position'] = position
+            df.loc[curr_idx, 'entry_price'] = entry_price if position != 0 else None
 
-            if active_trade is None:
-                df.loc[curr_idx, 'balance'] = df.loc[prev_idx, 'balance']
-                df.loc[curr_idx, 'equity'] = df.loc[prev_idx, 'balance']
+        # Close any remaining open position at the end of the test period
+        if position != 0:
+            last_idx = df.index[-1]
+            last_price = df.loc[last_idx, 'open']
+            if position == 1:
+                exit_price = last_price - slippage_cost
+                profit_loss = (exit_price - entry_price) * active_trade['size']
             else:
-                df.loc[curr_idx, 'balance'] = df.loc[prev_idx, 'balance']
-                curr_price = df.loc[curr_idx, 'close']
-                if active_trade['type'] == 'long':
-                    unrealized_return = (curr_price - active_trade['entry_price']) / active_trade['entry_price']
-                else:
-                    unrealized_return = (active_trade['entry_price'] - curr_price) / active_trade['entry_price']
-                unrealized_pnl = unrealized_return * active_trade['size']
-                df.loc[curr_idx, 'equity'] = df.loc[prev_idx, 'balance'] + unrealized_pnl
+                exit_price = last_price + slippage_cost
+                profit_loss = (entry_price - exit_price) * active_trade['size']
+            max_loss = -initial_balance * 0.05
+            if profit_loss < max_loss:
+                profit_loss = max_loss
+            balance += profit_loss
+            current_pl = df.loc[last_idx, 'profit_loss'] if 'profit_loss' in df.columns else 0
+            if pd.isna(current_pl):
+                current_pl = 0
+            df.loc[last_idx, 'profit_loss'] = current_pl + profit_loss
+            trades.append({
+                'time': last_idx,
+                'action': 'CLOSE_FINAL',
+                'price': exit_price,
+                'size': active_trade['size'] if active_trade else 0,
+                'profit_loss': profit_loss,
+                'balance': balance
+            })
 
-            if i > 0 and not np.isnan(df.loc[curr_idx, 'exit_price']):
-                last_trade = trades[-1]
-                df.loc[curr_idx:, 'balance'] = df.loc[prev_idx, 'balance'] + last_trade['pnl']
+        df['cum_profit_loss'] = df['profit_loss'].cumsum()
 
-        metrics = {}
-        if trades:
-            trades_df = pd.DataFrame(trades)
-            total_pnl = trades_df['pnl'].sum()
-            metrics['total_pnl'] = total_pnl
-            metrics['return_pct'] = (total_pnl / initial_balance) * 100
-            winning_trades = trades_df[trades_df['pnl'] > 0]
-            win_rate = len(winning_trades) / len(trades_df) if len(trades_df) > 0 else 0
-            metrics['win_rate'] = win_rate
-            metrics['avg_trade_return'] = trades_df['return'].mean()
-            metrics['avg_trade_pnl'] = trades_df['pnl'].mean()
-            if len(winning_trades) > 0 and len(trades_df) - len(winning_trades) > 0:
-                avg_win = winning_trades['pnl'].mean()
-                losing_trades = trades_df[trades_df['pnl'] <= 0]
-                avg_loss = losing_trades['pnl'].mean()
-                metrics['profit_factor'] = abs(avg_win / avg_loss) if avg_loss != 0 else float('inf')
+        metrics = {
+            'initial_balance': initial_balance,
+            'final_balance': balance,
+            'absolute_return': balance - initial_balance,
+            'return_pct': ((balance / initial_balance) - 1) * 100,
+            'n_trades': len(trades)
+        }
+
+        if metrics['n_trades'] > 0:
+            profit_trades = [t for t in trades if t.get('profit_loss', 0) > 0]
+            loss_trades = [t for t in trades if t.get('profit_loss', 0) < 0]
+
+            metrics['n_winning_trades'] = len(profit_trades)
+            metrics['n_losing_trades'] = len(loss_trades)
+            metrics['win_rate'] = len(profit_trades) / len(trades) if trades else 0
+
+            total_profit = sum(t.get('profit_loss', 0) for t in profit_trades)
+            total_loss = abs(sum(t.get('profit_loss', 0) for t in loss_trades))
+            metrics['profit_factor'] = total_profit / total_loss if total_loss > 0 else 0
+
+            peak = initial_balance
+            max_drawdown = 0
+            balance_curve = df[['balance']].dropna()
+            for idx, row in balance_curve.iterrows():
+                current_balance = row['balance']
+                if current_balance > peak:
+                    peak = current_balance
+                drawdown = (peak - current_balance) / peak * 100
+                max_drawdown = max(max_drawdown, drawdown)
+            metrics['max_drawdown_pct'] = max_drawdown
+
+            daily_returns = df['profit_loss'] / df['balance'].shift(1)
+            daily_returns = daily_returns.replace([np.inf, -np.inf], np.nan).dropna()
+            if len(daily_returns) > 0:
+                sharpe_ratio = daily_returns.mean() / daily_returns.std() * np.sqrt(252)  # Annualized
+                metrics['sharpe_ratio'] = sharpe_ratio
             else:
-                metrics['profit_factor'] = float('inf') if win_rate == 1 else 0
-
-            equity_curve = df['equity']
-            rolling_max = equity_curve.cummax()
-            drawdown = (equity_curve - rolling_max) / rolling_max
-            max_drawdown = drawdown.min()
-            metrics['max_drawdown'] = max_drawdown
-            metrics['max_drawdown_pct'] = max_drawdown * 100
-            metrics['n_trades'] = len(trades_df)
-            metrics['n_winning_trades'] = len(winning_trades)
-            metrics['n_losing_trades'] = len(trades_df) - len(winning_trades)
-            metrics['sharpe_ratio'] = self._calculate_sharpe_ratio(df['balance'].pct_change().dropna())
-            metrics['sortino_ratio'] = self._calculate_sortino_ratio(df['balance'].pct_change().dropna())
-            metrics['final_balance'] = df['balance'].iloc[-1]
-            self.logger.debug("Trading metrics calculated: %s", metrics)
+                metrics['sharpe_ratio'] = 0
         else:
-            metrics = {
-                'total_pnl': 0,
-                'return_pct': 0,
-                'win_rate': 0,
-                'avg_trade_return': 0,
-                'avg_trade_pnl': 0,
-                'profit_factor': 0,
-                'max_drawdown': 0,
-                'max_drawdown_pct': 0,
-                'n_trades': 0,
+            metrics.update({
                 'n_winning_trades': 0,
                 'n_losing_trades': 0,
-                'sharpe_ratio': 0,
-                'sortino_ratio': 0,
-                'final_balance': initial_balance
-            }
-            self.logger.debug("No trades executed; metrics set to default values.")
+                'win_rate': 0,
+                'profit_factor': 0,
+                'max_drawdown_pct': 0,
+                'sharpe_ratio': 0
+            })
+
+        self.logger.info(f"Backtest Results:")
+        self.logger.info(f"  Initial Balance: ${metrics['initial_balance']:.2f}")
+        self.logger.info(f"  Final Balance: ${metrics['final_balance']:.2f}")
+        self.logger.info(f"  Return: {metrics['return_pct']:.2f}%")
+        self.logger.info(f"  Number of Trades: {metrics['n_trades']}")
+
+        if metrics['n_trades'] > 0:
+            self.logger.info(f"  Win Rate: {metrics['win_rate']:.2f}")
+            self.logger.info(f"  Profit Factor: {metrics['profit_factor']:.2f}")
+            self.logger.info(f"  Max Drawdown: {metrics['max_drawdown_pct']:.2f}%")
+            self.logger.info(f"  Sharpe Ratio: {metrics['sharpe_ratio']:.2f}")
+
+        storage = DataStorage()
+        model_name = os.path.basename(model_path).replace('.joblib', '')
+        backtest_results = {
+            'metrics': metrics,
+            'trades': trades,
+            'balance_curve': df[['balance']].copy(),
+            'signals': df[['signal', 'trade_action']].copy(),
+            'predictions': df[['pred_prob_up', 'pred_prob_down']].copy() if 'pred_prob_up' in df.columns else None
+        }
+
+        results_path = storage.save_results(
+            backtest_results,
+            f"{model_name}_backtest_{timeframe}",
+            include_timestamp=True
+        )
+        self.logger.info(f"Saved backtest results to {results_path}")
+
         return metrics, df, trades
 
     def _calculate_sharpe_ratio(self, returns: pd.Series, risk_free_rate: float = 0.0) -> float:

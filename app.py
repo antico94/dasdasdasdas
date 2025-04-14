@@ -1,6 +1,7 @@
 import os
 import sys
 from typing import Dict, List, Optional
+import yaml
 
 from config.constants import AppMode
 from data.fetcher import MT5DataFetcher
@@ -17,8 +18,16 @@ class TradingBotApp:
     def __init__(self):
         self.cli = TradingBotCLI()
         self.data_storage = DataStorage()
-        # You might also want to load a global configuration here
-        self.config = {}  # or load your config from a file if needed
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(project_root, "config", "config.yaml")
+
+        try:
+            with open(config_path, "r") as file:
+                self.config = yaml.safe_load(file)
+            logger.info("Loaded configuration from %s", config_path)
+        except Exception as e:
+            logger.error("Failed to load configuration: %s", str(e))
+            self.config = {}
         logger.info("TradingBotApp initialized.")
 
     def run(self):
@@ -102,16 +111,19 @@ class TradingBotApp:
 
     def _update_mt5_config(self, server: str, login: int, password: str):
         """Update MT5 configuration in config.yaml file."""
-        import yaml
-        config_path = "config/config.yaml"
-        with open(config_path, "r") as file:
-            config = yaml.safe_load(file)
-        config["mt5"]["server"] = server
-        config["mt5"]["login"] = login
-        config["mt5"]["password"] = password
-        with open(config_path, "w") as file:
-            yaml.dump(config, file, default_flow_style=False)
-        logger.info("Updated MT5 configuration in %s", config_path)
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(project_root, "config", "config.yaml")
+        try:
+            with open(config_path, "r") as file:
+                config = yaml.safe_load(file)
+            config["mt5"]["server"] = server
+            config["mt5"]["login"] = login
+            config["mt5"]["password"] = password
+            with open(config_path, "w") as file:
+                yaml.dump(config, file, default_flow_style=False)
+            logger.info("Updated MT5 configuration in %s", config_path)
+        except Exception as e:
+            logger.error("Failed to update MT5 config: %s", str(e))
 
     def _handle_process_data(self):
         """Handle data processing action."""
@@ -172,16 +184,36 @@ class TradingBotApp:
             return
 
         try:
-            self.config = self.config if hasattr(self, 'config') else {}
-            self.config['model'] = self.config.get('model', {})
+            if not hasattr(self, 'config') or not self.config:
+                project_root = os.path.dirname(os.path.abspath(__file__))
+                config_path = os.path.join(project_root, "config", "config.yaml")
+                try:
+                    with open(config_path, "r") as file:
+                        self.config = yaml.safe_load(file)
+                    logger.info("Loaded configuration from %s", config_path)
+                except Exception as e:
+                    logger.warning(f"Could not load config file: {str(e)}")
+                    self.config = {}
+
+            if 'model' not in self.config:
+                self.config['model'] = {}
+            if 'data' not in self.config:
+                self.config['data'] = {'split_ratio': 0.8}
+
             self.config['model']['type'] = options['model_type']
             self.config['model']['hyperparameter_tuning'] = options['hyperparameter_tuning']
             self.config['model']['feature_selection'] = options['feature_selection']
             self.config['model']['cross_validation'] = options['cross_validation']
 
+            if 'prediction_target' not in self.config['model']:
+                self.config['model']['prediction_target'] = 'direction'
+            if 'prediction_horizon' not in self.config['model']:
+                self.config['model']['prediction_horizon'] = 12
+
             from models.trainer import train_model_pipeline
             self.cli.show_progress("Training model", 100)
             model, metrics = train_model_pipeline(self.config, options['timeframe'])
+
             results = {
                 "Status": "Success",
                 "Model Type": options['model_type'],
@@ -198,6 +230,7 @@ class TradingBotApp:
             results["Feature Count"] = metrics.get('n_features', 0)
             results["Training Time"] = f"{metrics.get('training_time', 0):.2f} seconds"
             self.cli.show_results("Model Training Complete", results)
+
         except Exception as e:
             logger.exception("Error during model training: %s", str(e))
             self.cli.show_results("Error", {"Status": "Failed", "Error": str(e)})
@@ -216,7 +249,6 @@ class TradingBotApp:
             return
 
         try:
-            # Update backtest-related config options
             self.config = self.config if hasattr(self, 'config') else {}
             self.config['backtest'] = self.config.get('backtest', {})
             self.config['backtest']['initial_balance'] = options['initial_balance']
@@ -226,7 +258,6 @@ class TradingBotApp:
 
             from models.evaluator import backtest_model
             self.cli.show_progress("Running backtest", 100)
-            # Load model, processed data, and perform backtest.
             metrics, results_df, trades = backtest_model(
                 self.config,
                 options['model_file'],
@@ -236,9 +267,7 @@ class TradingBotApp:
                 options['include_spread'],
                 options['include_slippage']
             )
-            # Additional logging: check test data features from backtest metrics file
             logger.debug("Backtest metrics: %s", metrics)
-
             results = {
                 "Status": "Success",
                 "Model": os.path.basename(options['model_file']),

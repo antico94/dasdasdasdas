@@ -1,5 +1,6 @@
 Project structure of: C:\Users\ameiu\PycharmProjects\GoldML
 
+├── .gitignore
 ├── __init__.py
 ├── app.py
 ├── config
@@ -8,28 +9,58 @@ Project structure of: C:\Users\ameiu\PycharmProjects\GoldML
 ├── data
 │   ├── fetcher.py
 │   ├── historical
-│   │   ├── XAUUSD_D1_20250412_170955.csv
-│   │   ├── XAUUSD_D1_processed.csv
-│   │   ├── XAUUSD_H1_20250412_170955.csv
-│   │   ├── XAUUSD_H1_processed.csv
-│   │   ├── XAUUSD_M15_20250412_170955.csv
-│   │   ├── XAUUSD_M15_processed.csv
-│   │   ├── us_10y_yield_20250412_170958.csv
-│   │   └── usd_index_20250412_170958.csv
+│   │   ├── XAUUSD_D1_20250413_182107.csv
+│   │   ├── XAUUSD_H1_20250413_182107.csv
+│   │   └── XAUUSD_H1_processed.csv
 │   ├── indicators.py
+│   ├── models
+│   │   ├── ensemble_H1_direction_1_20250414_003727.joblib
+│   │   ├── ensemble_H1_direction_1_20250414_003727_metadata.pkl
+│   │   ├── ensemble_H1_direction_1_random_forest_20250414_003727.joblib
+│   │   └── ensemble_H1_direction_1_xgboost_20250414_003727.joblib
 │   ├── processor.py
 │   ├── results
+│   │   ├── ensemble_H1_direction_1_20250413_151332_backtest_H1_20250413_151936.pkl
 │   │   └── models
-│   │       └── ensemble_H1_direction_12_metrics.pkl
 │   └── storage.py
+├── debug_tools
+│   ├── analyze_model.py
+│   ├── analyze_predictions.py
+│   ├── analyze_trades.py
+│   ├── backtest_sma.py
+│   ├── data
+│   │   └── historical
+│   ├── diagnostic.py
+│   ├── feature_analysis.py
+│   ├── feature_importance.png
+│   ├── horizon_backtest.py
+│   ├── inspect_model.py
+│   ├── label_verification.py
+│   ├── logs
+│   │   └── DataProcessorLogger_20250414_125023.log
+│   ├── prediction_distribution.png
+│   ├── prediction_distribution_detailed.png
+│   ├── prediction_time_series.png
+│   ├── test_model.py
+│   └── trade_diagnostics.py
 ├── execution
 ├── logs
-│   └── TradingBotAppLogger_20250412_183718.log
+│   └── TradingBotAppLogger_20250414_004405.log
 ├── models
 │   ├── base.py
-│   ├── ensemble_H1_direction_12.joblib
-│   ├── ensemble_H1_direction_12_random_forest.joblib
-│   ├── ensemble_H1_direction_12_xgboost.joblib
+│   ├── data
+│   │   └── results
+│   │       ├── backtest_ensemble_H1_direction_12_H1_20250412_184724.pkl
+│   │       ├── backtest_ensemble_H1_direction_12_H1_20250412_185238.pkl
+│   │       ├── backtest_ensemble_H1_direction_12_H1_20250412_185343.pkl
+│   │       ├── backtest_ensemble_H1_direction_12_H1_20250412_185419.pkl
+│   │       ├── backtest_ensemble_H1_direction_12_H1_20250412_185507.pkl
+│   │       ├── backtest_ensemble_H1_direction_12_H1_20250412_193843.pkl
+│   │       ├── backtest_ensemble_H1_direction_12_H1_20250412_194056.pkl
+│   │       ├── backtest_ensemble_H1_direction_12_H1_20250412_204659.pkl
+│   │       ├── backtest_ensemble_H1_direction_12_H1_20250412_213939.pkl
+│   │       ├── backtest_ensemble_H1_direction_12_H1_20250412_214029.pkl
+│   │       └── backtest_ensemble_H1_direction_12_H1_20250412_223846.pkl
 │   ├── ensemble_model.py
 │   ├── evaluator.py
 │   ├── factory.py
@@ -46,4 +77,6 @@ Project structure of: C:\Users\ameiu\PycharmProjects\GoldML
 ├── ui
 │   └── cli.py
 └── utils
+    ├── csv_tools.py
+    ├── data_provider_test.py
     └── logger.py
