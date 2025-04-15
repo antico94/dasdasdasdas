@@ -299,40 +299,76 @@ class TradingBotApp:
             return
 
         try:
+            # Update config for backtest
             self.config = self.config if hasattr(self, 'config') else {}
             self.config['backtest'] = self.config.get('backtest', {})
             self.config['backtest']['initial_balance'] = options['initial_balance']
-            self.config['backtest']['position_size'] = options['risk_per_trade']
+            self.config['risk'] = self.config.get('risk', {})
+            self.config['risk']['risk_per_trade'] = options['risk_per_trade']
             self.config['backtest']['include_spread'] = options['include_spread']
             self.config['backtest']['include_slippage'] = options['include_slippage']
 
-            from models.evaluator import backtest_model
+            # Set up strategy configuration
+            self.config['strategy'] = self.config.get('strategy', {})
+            self.config['strategy']['take_profit_pct'] = 1.0  # Default values
+            self.config['strategy']['stop_loss_pct'] = 0.5
+            self.config['strategy']['max_hold_hours'] = 12
+            self.config['strategy']['use_trailing_stop'] = True
+            self.config['strategy']['min_confidence'] = 0.7
+
+            # Create strategy instance
+            from strategy.strategies import StrategyFactory
+            strategy = StrategyFactory.create_strategy('goldtrend', self.config)
+
+            # Call the backtest function with our strategy
+            from models.evaluator import backtest_model_with_strategy
+
             self.cli.show_progress("Running backtest", 100)
-            metrics, results_df, trades = backtest_model(
+            metrics, results_df, trades = backtest_model_with_strategy(
                 self.config,
                 options['model_file'],
                 options['timeframe'],
+                strategy,
                 options['initial_balance'],
                 options['risk_per_trade'],
                 options['include_spread'],
                 options['include_slippage']
             )
-            logger.debug("Backtest metrics: %s", metrics)
+
+            # Display results
             results = {
                 "Status": "Success",
                 "Model": os.path.basename(options['model_file']),
+                "Strategy": strategy.name,
                 "Timeframe": options['timeframe'],
                 "Initial Balance": f"${options['initial_balance']:.2f}",
                 "Final Balance": f"${metrics['final_balance']:.2f}",
                 "Total Return": f"{metrics['return_pct']:.2f}%",
-                "Number of Trades": metrics['n_trades'],
-                "Win Rate": f"{metrics['win_rate']:.2f}",
-                "Profit Factor": f"{metrics['profit_factor']:.2f}",
-                "Max Drawdown": f"{metrics['max_drawdown_pct']:.2f}%",
-                "Sharpe Ratio": f"{metrics['sharpe_ratio']:.2f}"
+                "Number of Trades": metrics['n_trades']
             }
+
+            # Add additional metrics if available
+            if 'win_rate' in metrics:
+                results["Win Rate"] = f"{metrics['win_rate']:.2f}"
+            if 'profit_factor' in metrics:
+                results["Profit Factor"] = f"{metrics['profit_factor']:.2f}"
+            if 'max_drawdown_pct' in metrics:
+                results["Max Drawdown"] = f"{metrics['max_drawdown_pct']:.2f}%"
+            if 'sharpe_ratio' in metrics:
+                results["Sharpe Ratio"] = f"{metrics['sharpe_ratio']:.2f}"
+
+            # Get exit reasons if available
+            strategy_stats = strategy.get_stats()
+            if 'tracking' in strategy_stats and 'exit_reasons' in strategy_stats['tracking']:
+                exit_reasons = strategy_stats['tracking']['exit_reasons']
+                if exit_reasons:
+                    reasons_str = ', '.join([f"{k}: {v}" for k, v in exit_reasons.items() if v > 0])
+                    if reasons_str:
+                        results["Exit Reasons"] = reasons_str
+
             self.cli.show_results("Backtest Complete", results)
 
+            # Show visualizations if requested
             if self.cli.confirm_action("view detailed backtest visualizations"):
                 from models.visualization import visualize_backtest_results
                 storage = DataStorage()
@@ -343,6 +379,7 @@ class TradingBotApp:
                     latest_backtest = max(backtest_files, key=lambda f: os.path.getctime(os.path.join(models_dir, f)))
                     backtest_path = os.path.join(models_dir, latest_backtest)
                     visualize_backtest_results(backtest_path)
+
         except Exception as e:
             logger.exception("Error during backtesting: %s", str(e))
             self.cli.show_results("Error", {"Status": "Failed", "Error": str(e)})
