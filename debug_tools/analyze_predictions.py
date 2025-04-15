@@ -5,13 +5,14 @@ import numpy as np
 import pandas as pd
 # Fix matplotlib backend to avoid GUI dependencies
 import matplotlib
-
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 import seaborn as sns
 import questionary
 from questionary import Choice, Separator
+
+matplotlib.use('Agg')
+
 
 # Add project root to path
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -24,7 +25,7 @@ from utils.logger import setup_logger
 
 # Import the report generator if it exists
 try:
-    from debug_tools.report_generator import generate_html_report
+    from debug_tools.report_generator_analyze_predictions import generate_html_report
 
     has_report_generator = True
 except ImportError:
@@ -907,7 +908,7 @@ def run_analysis(config):
         if config['generate_report'] and has_report_generator:
             report_path = config['report_path']
             try:
-                from debug_tools.report_generator import generate_html_report
+                from debug_tools.report_generator_analyze_predictions import generate_html_report
                 generate_html_report(results, report_path)
                 logger.info(f"HTML report generated: {report_path}")
                 print(f"\nAnalysis complete! Report generated at: {report_path}")

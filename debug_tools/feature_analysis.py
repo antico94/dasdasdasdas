@@ -30,7 +30,7 @@ def analyze_feature_importance():
 
     # Prepare features for analysis
     processor = DataProcessor()
-    horizon = 12
+    horizon = 1
     X, y = processor.prepare_ml_features(df, horizon=horizon)
     print(f"Prepared features: {X.shape}, target: {y.shape}")
 
@@ -42,7 +42,7 @@ def analyze_feature_importance():
 
     # Method 1: Analyze model's feature importance
     try:
-        model_path = "models/ensemble_H1_direction_12.joblib"
+        model_path = "../data_output/trained_models/ensemble_H1_direction_1_20250415_075832.joblib"
         model = ModelFactory.load_model(model_path)
 
         if hasattr(model, 'get_feature_importance'):

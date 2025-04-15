@@ -30,7 +30,7 @@ def verify_labels():
         logger.info(f"Loaded {len(df)} rows with {df.shape[1]} columns")
 
         # 2. Check target variable
-        horizon = 12
+        horizon = 1
         target_col = f'target_{horizon}'
 
         if target_col in df.columns:

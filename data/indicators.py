@@ -110,14 +110,9 @@ class TechnicalIndicators:
         return df
 
     def add_volatility_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Add volatility indicators such as Bollinger Bands and ATR.
-        Parameters are taken from config where available.
-        """
         indicators_config = self.config.get("features", {}).get("technical_indicators", [])
-        volatility_config = next(
-            (item["indicators"] for item in indicators_config if item.get("type") == "volatility"), []
-        )
+        volatility_config = next((item["indicators"] for item in indicators_config if item.get("type") == "volatility"),
+                                 [])
 
         for indicator in volatility_config:
             if indicator.get("name") == "bbands":
@@ -125,37 +120,48 @@ class TechnicalIndicators:
                 length = params.get("length", 20)
                 std_val = params.get("std", 2)
                 try:
+                    # Ensure that the 'close' column has no missing values
+                    if df["close"].isna().any():
+                        logger.info("Filling missing values in 'close' column with forward/backward fill.")
+                        df["close"] = df["close"].fillna(method="ffill").fillna(method="bfill")
+
+                    # Calculate Bollinger Bands using pandas-ta
                     bbands = ta.bbands(df["close"], length=length, std=std_val)
+                    logger.info(f"Bbands columns returned: {bbands.columns.tolist()}")
 
-                    # Directly use standardized naming convention
-                    df["BBL_20_2.0"] = bbands.get(f"BBL_{length}_{std_val}", np.nan)
-                    df["BBM_20_2.0"] = bbands.get(f"BBM_{length}_{std_val}", np.nan)
-                    df["BBU_20_2.0"] = bbands.get(f"BBU_{length}_{std_val}", np.nan)
-                    df["BBP_20_2.0"] = bbands.get(f"BBP_{length}_{std_val}", np.nan)
+                    # Merge the Bollinger Bands into the DataFrame
+                    df = pd.concat([df, bbands], axis=1)
 
-                    # Instead of filling with constants, use forward/backward fill
-                    for col in ["BBL_20_2.0", "BBM_20_2.0", "BBU_20_2.0", "BBP_20_2.0"]:
-                        if col in df.columns and df[col].isna().any():
+                    # Define expected column names based on the parameters.
+                    # pandas-ta often returns column names like "BBL_20_2.0", etc.
+                    expected_cols = [
+                        f"BBL_{length}_{float(std_val)}",
+                        f"BBM_{length}_{float(std_val)}",
+                        f"BBU_{length}_{float(std_val)}",
+                        f"BBP_{length}_{float(std_val)}"
+                    ]
+
+                    for col in expected_cols:
+                        if col in df.columns:
+                            # Fill missing values using forward/backward fill then median for edge cases.
+                            if df[col].isna().all():
+                                logger.warning(f"All values in {col} are NaN after computing Bollinger Bands.")
                             df[col] = df[col].fillna(method='ffill').fillna(method='bfill')
-                            # If still NaN (at the edges), use median
                             if df[col].isna().any():
                                 df[col] = df[col].fillna(df[col].median())
-
-                            # Verify Bollinger Bands have multiple unique values
                             unique_vals = df[col].nunique()
                             if unique_vals < 5:
                                 logger.warning(f"{col} has only {unique_vals} unique values")
+                        else:
+                            logger.warning(f"Expected Bollinger Band column '{col}' not found in the results.")
                 except Exception as e:
                     logger.warning(f"Failed to compute Bollinger Bands: {e}")
 
             elif indicator.get("name") == "atr":
                 period = indicator.get("params", [14])[0] if isinstance(indicator.get("params"), list) else 14
                 try:
-                    # Directly calculate with standardized names
                     df["atr_14"] = ta.atr(df["high"], df["low"], df["close"], length=period)
                     df["atr_pct_14"] = df["atr_14"] / df["close"] * 100
-
-                    # Verify ATR has multiple unique values
                     for col in ["atr_14", "atr_pct_14"]:
                         unique_vals = df[col].nunique()
                         if unique_vals < 5:

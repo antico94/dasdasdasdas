@@ -11,7 +11,7 @@ from ui.cli import TradingBotCLI
 from utils.logger import setup_logger
 
 # Initialize a unified logger for the application
-logger = setup_logger("TradingBotAppLogger")
+logger = setup_logger("App.py - Logger")
 
 
 class TradingBotApp:

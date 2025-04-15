@@ -4,8 +4,6 @@ import yaml
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
-
-from config.constants import IndicatorType
 from data.indicators import TechnicalIndicators
 from utils.logger import setup_logger
 

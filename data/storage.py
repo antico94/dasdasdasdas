@@ -2,201 +2,162 @@ import os
 import pickle
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Optional
 
 import joblib
 import pandas as pd
 import yaml
+from utils.logger import setup_logger
+
+logger = setup_logger(__name__)
 
 
 class DataStorage:
     def __init__(self, config_path: Optional[str] = None):
-        # Use pathlib to compute the project root robustly.
-        # __file__ is the path to this file (should be .../GoldML/data/storage.py)
+        # Compute the project root based on the location of this file.
         current_file = Path(__file__).resolve()
-        # project_root should be one level above the 'data' folder:
-        project_root = current_file.parents[1]  # This yields .../GoldML
+        self.project_root = current_file.parents[1]  # e.g., C:/Users/ameiu/PycharmProjects/GoldML
 
-        # If no config_path is provided, use the computed project root.
+        # Determine the configuration file path.
         if config_path is None:
-            config_path = project_root / "config" / "config.yaml"
+            config_path = self.project_root / "config" / "config.yaml"
         else:
             config_path = Path(config_path)
 
-        # Debug log the computed config path (you can print or log it)
-        print(f"DEBUG: Attempting to load config from: {config_path}")
-
+        logger.info(f"Attempting to load config from: {config_path}")
         if not config_path.exists():
             raise FileNotFoundError(f"Configuration file not found at {config_path}")
 
-        # Load the configuration from YAML.
+        # Load configuration.
         with open(config_path, "r") as file:
             self.config = yaml.safe_load(file)
 
-        # Convert the save_path (from config) to an absolute path, assuming it's relative to the project root.
+        # Convert the save_path (from config) to an absolute path relative to the project root.
         save_path = self.config["data"]["save_path"]
         save_path = Path(save_path)
         if not save_path.is_absolute():
-            self.base_path = project_root / save_path
+            self.base_path = self.project_root / save_path
         else:
             self.base_path = save_path
 
-        os.makedirs(self.base_path, exist_ok=True)
+        # Ensure the base path exists.
+        self.base_path.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Base path set to: {self.base_path}")
 
-
-    def save_dataframe(
-            self,
-            df: pd.DataFrame,
-            name: str,
-            include_timestamp: bool = True
-    ) -> str:
-        """Save a DataFrame to CSV."""
+    def save_dataframe(self, df: pd.DataFrame, name: str, include_timestamp: bool = True) -> str:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") if include_timestamp else ""
         filename = f"{name}_{timestamp}.csv" if timestamp else f"{name}.csv"
-        filepath = os.path.join(self.base_path, filename)
+        filepath = self.base_path / filename
 
         df.to_csv(filepath)
-        print(f"Saved DataFrame to {filepath}")
-        return filepath
+        logger.info(f"Saved DataFrame to {filepath}")
+        return str(filepath)
 
     def load_dataframe(self, filepath: str) -> pd.DataFrame:
-        """Load a DataFrame from CSV."""
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f"File not found: {filepath}")
-
-        df = pd.read_csv(filepath, index_col=0, parse_dates=True)
-        print(f"Loaded DataFrame from {filepath}: {len(df)} rows, {df.shape[1]} columns")
+        fp = Path(filepath)
+        if not fp.exists():
+            raise FileNotFoundError(f"File not found: {fp}")
+        df = pd.read_csv(fp, index_col=0, parse_dates=True)
+        logger.info(f"Loaded DataFrame from {fp}: {len(df)} rows, {df.shape[1]} columns")
         return df
 
-    def save_model(
-            self,
-            model: Any,
-            name: str,
-            include_timestamp: bool = True,
-            metadata: Optional[Dict] = None
-    ) -> str:
-        """Save a trained model to disk."""
-        models_dir = os.path.join(self.base_path, "../models")
-        os.makedirs(models_dir, exist_ok=True)
+    def save_model(self, model: Any, name: str, include_timestamp: bool = True, metadata: Optional[Dict] = None) -> str:
+        # Build the models directory relative to the project root.
+        models_dir = self.project_root / "data_output" / "trained_models"
+        models_dir.mkdir(parents=True, exist_ok=True)
 
+        # Create the file name; include timestamp only if desired.
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") if include_timestamp else ""
         filename = f"{name}_{timestamp}.joblib" if timestamp else f"{name}.joblib"
-        filepath = os.path.join(models_dir, filename)
+        filepath = models_dir / filename
 
-        # Save model
+        # Save the model.
         joblib.dump(model, filepath)
 
-        # Save metadata if provided
         if metadata:
-            metadata_path = os.path.join(models_dir,
-                                         f"{name}_{timestamp}_metadata.pkl" if timestamp else f"{name}_metadata.pkl")
+            metadata_filename = f"{name}_{timestamp}_metadata.pkl" if timestamp else f"{name}_metadata.pkl"
+            metadata_path = models_dir / metadata_filename
             with open(metadata_path, "wb") as f:
                 pickle.dump(metadata, f)
+            logger.info(f"Saved model metadata to {metadata_path}")
 
-        print(f"Saved model to {filepath}")
-        return filepath
+        logger.info(f"Saved model to {filepath}")
+        return str(filepath)
 
     def load_model(self, filepath: str) -> Any:
-        """Load a trained model from disk."""
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f"Model file not found: {filepath}")
+        fp = Path(filepath)
+        if not fp.exists():
+            raise FileNotFoundError(f"Model file not found: {fp}")
+        model = joblib.load(fp)
+        logger.info(f"Loaded model from {fp}")
 
-        model = joblib.load(filepath)
-        print(f"Loaded model from {filepath}")
-
-        # Check for metadata
-        metadata_path = filepath.replace(".joblib", "_metadata.pkl")
-        if os.path.exists(metadata_path):
+        # Load model metadata if available.
+        metadata_path = fp.with_name(fp.stem + "_metadata.pkl")
+        if metadata_path.exists():
             with open(metadata_path, "rb") as f:
                 metadata = pickle.load(f)
-            print(f"Loaded model metadata: {list(metadata.keys())}")
+            logger.info(f"Loaded model metadata: {list(metadata.keys())}")
             return model, metadata
-
         return model
 
     def save_scaler(self, scaler: Any, name: str) -> str:
-        """Save a fitted scaler to disk."""
-        scalers_dir = os.path.join(self.base_path, "../models/scalers")
-        os.makedirs(scalers_dir, exist_ok=True)
-
-        filepath = os.path.join(scalers_dir, f"{name}_scaler.joblib")
+        scalers_dir = self.project_root / "data_output" / "models" / "scalers"
+        scalers_dir.mkdir(parents=True, exist_ok=True)
+        filepath = scalers_dir / f"{name}_scaler.joblib"
         joblib.dump(scaler, filepath)
-        print(f"Saved scaler to {filepath}")
-        return filepath
+        logger.info(f"Saved scaler to {filepath}")
+        return str(filepath)
 
     def load_scaler(self, filepath: str) -> Any:
-        """Load a fitted scaler from disk."""
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f"Scaler file not found: {filepath}")
-
-        scaler = joblib.load(filepath)
-        print(f"Loaded scaler from {filepath}")
+        fp = Path(filepath)
+        if not fp.exists():
+            raise FileNotFoundError(f"Scaler file not found: {fp}")
+        scaler = joblib.load(fp)
+        logger.info(f"Loaded scaler from {fp}")
         return scaler
 
-    def save_results(
-            self,
-            results: Dict,
-            name: str,
-            include_timestamp: bool = True
-    ) -> str:
-        """Save results (like backtest results) to disk."""
-        results_dir = os.path.join(self.base_path, "../results")
-        os.makedirs(results_dir, exist_ok=True)
+    def save_results(self, results: Dict, name: str, include_timestamp: bool = True) -> str:
+        # Fetch results save path from config. If not set, use a default.
+        config_results_path = self.config["data"].get("results_path", "data_output/results/models")
+        results_dir = self.project_root / config_results_path
+        results_dir.mkdir(parents=True, exist_ok=True)
 
-        # If the provided name ends with '.pkl', remove it to avoid duplicating the extension.
+        # Remove the .pkl extension from name if already present.
         if name.endswith(".pkl"):
             name = name[:-4]
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") if include_timestamp else ""
         filename = f"{name}_{timestamp}.pkl" if timestamp else f"{name}.pkl"
-        filepath = os.path.join(results_dir, filename)
+        filepath = results_dir / filename
 
         with open(filepath, "wb") as f:
             pickle.dump(results, f)
 
-        print(f"Saved results to {filepath}")
-        return filepath
+        logger.info(f"Saved results to {filepath}")
+        return str(filepath)
 
     def load_results(self, filepath: str) -> Dict:
-        """Load results from disk."""
-        # Check if filepath already has .pkl extension to avoid duplication
-        if not filepath.endswith('.pkl'):
-            filepath = filepath + '.pkl'
-
-        # Make sure we have an absolute path if a relative path was provided
-        if not os.path.isabs(filepath):
-            if os.path.exists(filepath):
-                pass  # Use as is if it exists
-            elif filepath.startswith('models/'):
-                # Fix path for model-specific files that might be in a different directory
-                filepath = os.path.join(self.base_path, "../", filepath)
-            else:
-                # Default to looking in the results directory
-                filepath = os.path.join(self.base_path, "../results", filepath)
-
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f"Results file not found: {filepath}")
-
-        with open(filepath, "rb") as f:
+        fp = Path(filepath)
+        if not fp.is_absolute():
+            # Assume relative to the default results directory.
+            fp = self.project_root / "data_output" / "results" / fp
+        if not fp.exists():
+            raise FileNotFoundError(f"Results file not found: {fp}")
+        with open(fp, "rb") as f:
             results = pickle.load(f)
-
-        print(f"Loaded results from {filepath}")
+        logger.info(f"Loaded results from {fp}")
         return results
 
     def find_latest_file(self, pattern: str) -> Optional[str]:
-        """Find the latest file matching the pattern."""
-        matching_files = list(Path(self.base_path).glob(pattern))
+        matching_files = list(self.base_path.glob(pattern))
         if not matching_files:
             return None
-
-        latest_file = max(matching_files, key=os.path.getctime)
+        latest_file = max(matching_files, key=lambda f: f.stat().st_ctime)
         return str(latest_file)
 
     def find_latest_data(self, symbol: Optional[str] = None, timeframe: Optional[str] = None) -> Dict[str, str]:
-        """Find the latest data files."""
         if symbol is None:
             symbol = self.config["data"]["symbol"]
-
         if timeframe:
             pattern = f"{symbol}_{timeframe}_*.csv"
             latest = self.find_latest_file(pattern)
@@ -208,49 +169,37 @@ class DataStorage:
                 latest = self.find_latest_file(pattern)
                 if latest:
                     latest_files[tf] = latest
-
             return latest_files
 
     def find_latest_processed_data(self, symbol: Optional[str] = None) -> Dict[str, str]:
-        """Find the latest processed data files."""
         if symbol is None:
             symbol = self.config["data"]["symbol"]
-
         processed_files = {}
         for tf in self.config["data"]["timeframes"]:
-            pattern = f"{symbol}_{tf}_processed.csv"
-            file_path = os.path.join(self.base_path, pattern)
-            if os.path.exists(file_path):
-                processed_files[tf] = file_path
-
+            filename = f"{symbol}_{tf}_processed.csv"
+            file_path = self.base_path / filename
+            if file_path.exists():
+                processed_files[tf] = str(file_path)
         return processed_files
 
     def find_latest_model(self, model_type: str) -> Optional[str]:
-        """Find the latest model file of a given type."""
-        models_dir = os.path.join(self.base_path, "../models")
-        if not os.path.exists(models_dir):
+        models_dir = self.project_root / "data_output" / "trained_models"
+        if not models_dir.exists():
             return None
-
         pattern = f"{model_type}_*.joblib"
-        matching_files = list(Path(models_dir).glob(pattern))
+        matching_files = list(models_dir.glob(pattern))
         if not matching_files:
             return None
-
-        latest_model = max(matching_files, key=os.path.getctime)
+        latest_model = max(matching_files, key=lambda f: f.stat().st_ctime)
         return str(latest_model)
 
 
 def main():
-    """Test function for data storage."""
     storage = DataStorage()
-
-    # Test finding latest data
     latest_files = storage.find_latest_data()
     print("Latest data files:")
     for tf, path in latest_files.items():
         print(f"  {tf}: {path}")
-
-    # Test finding latest processed data
     processed_files = storage.find_latest_processed_data()
     print("\nLatest processed data files:")
     for tf, path in processed_files.items():
