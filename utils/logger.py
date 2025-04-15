@@ -1,4 +1,5 @@
 import logging
+import sys
 from datetime import datetime
 import yaml
 from pathlib import Path
@@ -32,20 +33,14 @@ def setup_logger(name: str = "DefaultLogger") -> logging.Logger:
         except Exception as e:
             print(f"Warning: Could not delete existing log file {log_path}: {e}")
 
-    # Optional: Remove all handlers from all existing loggers to free file locks
-    for logger_name in logging.root.manager.loggerDict:
-        logger_instance = logging.getLogger(logger_name)
-        handlers = logger_instance.handlers[:]
-        for handler in handlers:
-            try:
-                handler.close()
-            except Exception as e:
-                print(f"Warning: Failed to close handler: {e}")
-            logger_instance.removeHandler(handler)
+    # Remove all handlers from the root logger and the named logger
+    logging.root.handlers = []
 
-    # Create and configure the logger instance
+    # Create and configure the logger instance - use root logger to prevent propagation issues
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
+    # Ensure propagation is disabled to prevent duplicate logs
+    logger.propagate = False
     # Clear any existing handlers on this logger instance
     logger.handlers = []
 
@@ -53,8 +48,8 @@ def setup_logger(name: str = "DefaultLogger") -> logging.Logger:
     fh = logging.FileHandler(log_path, mode='w')
     fh.setLevel(logging.DEBUG)
 
-    # Create a console handler for logging to the console
-    ch = logging.StreamHandler()
+    # Create a console handler for logging to the console - use sys.stdout explicitly
+    ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
 
     # Set formatter to include timestamp, level, filename, line number, function name, and message
@@ -67,5 +62,56 @@ def setup_logger(name: str = "DefaultLogger") -> logging.Logger:
     # Add handlers to the logger
     logger.addHandler(fh)
     logger.addHandler(ch)
+
+    # Add a custom method to force flushing after each log message
+    original_info = logger.info
+    original_debug = logger.debug
+    original_warning = logger.warning
+    original_error = logger.error
+    original_critical = logger.critical
+
+    def force_flush_info(msg, *args, **kwargs):
+        result = original_info(msg, *args, **kwargs)
+        for handler in logger.handlers:
+            handler.flush()
+        sys.stdout.flush()
+        return result
+
+    def force_flush_debug(msg, *args, **kwargs):
+        result = original_debug(msg, *args, **kwargs)
+        for handler in logger.handlers:
+            handler.flush()
+        return result
+
+    def force_flush_warning(msg, *args, **kwargs):
+        result = original_warning(msg, *args, **kwargs)
+        for handler in logger.handlers:
+            handler.flush()
+        sys.stdout.flush()
+        return result
+
+    def force_flush_error(msg, *args, **kwargs):
+        result = original_error(msg, *args, **kwargs)
+        for handler in logger.handlers:
+            handler.flush()
+        sys.stdout.flush()
+        return result
+
+    def force_flush_critical(msg, *args, **kwargs):
+        result = original_critical(msg, *args, **kwargs)
+        for handler in logger.handlers:
+            handler.flush()
+        sys.stdout.flush()
+        return result
+
+    # Replace the logger methods with our custom flushing versions
+    logger.info = force_flush_info
+    logger.debug = force_flush_debug
+    logger.warning = force_flush_warning
+    logger.error = force_flush_error
+    logger.critical = force_flush_critical
+
+    # Log a test message to verify setup
+    logger.info(f"Logger '{name}' initialized successfully")
 
     return logger

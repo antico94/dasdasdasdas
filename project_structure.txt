@@ -14,16 +14,15 @@ Project structure of: C:\Users\ameiu\PycharmProjects\GoldML
 ├── data_output
 │   ├── fetched_data_for_testing
 │   ├── fetched_data_for_training
-│   │   ├── XAUUSD_D1_20250415_074811.csv
-│   │   ├── XAUUSD_H1_20250415_074811.csv
+│   │   ├── XAUUSD_D1_20250415_102919.csv
+│   │   ├── XAUUSD_H1_20250415_102919.csv
 │   │   └── XAUUSD_H1_processed.csv
 │   ├── logs
-│   ├── results
+│   │   ├── App.py - Logger.log
 │   └── trained_models
-│       ├── ensemble_H1_direction_1_20250415_075832.joblib
-│       ├── ensemble_H1_direction_1_20250415_075832_metadata.pkl
-│       ├── ensemble_H1_direction_1_random_forest_20250415_075832.joblib
-│       └── ensemble_H1_direction_1_xgboost_20250415_075832.joblib
+│       ├── ensemble_H1_direction_1_best_20250415_132006.joblib
+│       ├── ensemble_H1_direction_1_best_20250415_132006_metadata.pkl
+│       └── ensemble_H1_direction_1_optimization.pkl
 ├── debug_tools
 │   ├── analyze_model.py
 │   ├── analyze_predictions.py
@@ -32,20 +31,11 @@ Project structure of: C:\Users\ameiu\PycharmProjects\GoldML
 │   ├── diagnostic.py
 │   ├── feature_analysis.py
 │   ├── feature_importance.png
-│   ├── horizon_backtest.py
 │   ├── inspect_model.py
 │   ├── label_verification.py
-│   ├── logs
-│   │   └── DataProcessorLogger_20250415_080005.log
-│   ├── prediction_distribution.png
-│   ├── prediction_distribution_detailed.png
-│   ├── prediction_time_series.png
 │   ├── report_generator_analyze_predictions.py
 │   ├── test_model.py
 │   └── trade_diagnostics.py
-├── execution
-├── logs
-│   └── DataProcessorLogger_20250415_081312.log
 ├── models
 │   ├── base.py
 │   ├── ensemble_model.py
@@ -58,12 +48,7 @@ Project structure of: C:\Users\ameiu\PycharmProjects\GoldML
 │   ├── trainer.py
 │   ├── visualization.py
 │   └── xgboost_model.py
-├── project_structure.txt
-├── requirements.txt
-├── strategy
 ├── ui
 │   └── cli.py
 └── utils
-    ├── csv_tools.py
-    ├── data_provider_test.py
     └── logger.py

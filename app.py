@@ -1,7 +1,6 @@
 import os
-import sys
-from typing import Dict, List, Optional
 import yaml
+import joblib
 
 from config.constants import AppMode
 from data.fetcher import MT5DataFetcher
@@ -85,7 +84,8 @@ class TradingBotApp:
                     self.cli.show_progress("Fetching price data", options['lookback_days'])
                     data_dict = fetcher.fetch_all_timeframes(lookback_days=options['lookback_days'])
                     if not data_dict:
-                        self.cli.show_results("Error", {"Status": "No data retrieved. Check MT5 connection and symbol."})
+                        self.cli.show_results("Error",
+                                              {"Status": "No data retrieved. Check MT5 connection and symbol."})
                         return
                     fetcher.save_data(data_dict)
 
@@ -104,7 +104,8 @@ class TradingBotApp:
                 finally:
                     fetcher.shutdown()
             else:
-                self.cli.show_results("Error", {"Status": "Failed to connect to MT5. Check your settings in config.yaml"})
+                self.cli.show_results("Error",
+                                      {"Status": "Failed to connect to MT5. Check your settings in config.yaml"})
         except Exception as e:
             logger.exception("Error during data fetching: %s", str(e))
             self.cli.show_results("Error", {"Status": "Failed", "Error": str(e)})
@@ -200,25 +201,74 @@ class TradingBotApp:
             if 'data' not in self.config:
                 self.config['data'] = {'split_ratio': 0.8}
 
+            # Set model configuration options
             self.config['model']['type'] = options['model_type']
             self.config['model']['hyperparameter_tuning'] = options['hyperparameter_tuning']
             self.config['model']['feature_selection'] = options['feature_selection']
             self.config['model']['cross_validation'] = options['cross_validation']
+
+            # Add this line to enable using optimized parameters
+            self.config['model']['use_bayes_optimizer'] = True
+
+            # Check if optimization file exists and has valid parameters
+            optimized_file = f"{options['model_type']}_H1_direction_1_optimization.pkl"
+            optimized_path = os.path.join("data_output", "trained_models", optimized_file)
+            if os.path.exists(optimized_path):
+                opt_results = joblib.load(optimized_path)
+                best_params = opt_results.get("best_params", {})
+                if not best_params or (isinstance(best_params, dict) and all(not v for v in best_params.values())):
+                    logger.warning(f"Optimization file exists but contains empty parameters: {best_params}")
+                    # Options:
+                    # 1. Regenerate optimization
+                    if self.cli.confirm_action("optimization file contains empty parameters. Run optimization first"):
+                        self._handle_optimize()
+                        return
+                    # 2. Disable use_bayes_optimizer if parameters are empty
+                    else:
+                        self.config['model']['use_bayes_optimizer'] = False
+                        logger.info("Disabled use_bayes_optimizer due to empty parameters")
 
             if 'prediction_target' not in self.config['model']:
                 self.config['model']['prediction_target'] = 'direction'
             if 'prediction_horizon' not in self.config['model']:
                 self.config['model']['prediction_horizon'] = 12
 
-            from models.trainer import train_model_pipeline
-            self.cli.show_progress("Training model", 100)
-            model, metrics = train_model_pipeline(self.config, options['timeframe'])
+            # Ask user if they want to run multiple training iterations for best model
+            num_runs = 1
+            use_best_model = self.cli.confirm_action("run multiple training iterations to find the best model")
+            if use_best_model:
+                # Get number of runs from user (with default of 5)
+                from ui.cli import Choice
+                num_runs_choices = [
+                    Choice("3 runs (faster)", 3),
+                    Choice("5 runs (recommended)", 5),
+                    Choice("10 runs (thorough)", 10),
+                    Choice("20 runs (extensive)", 20)
+                ]
+                num_runs = self.cli.select("Select number of training iterations:", choices=num_runs_choices)
+                logger.info(f"User selected {num_runs} training iterations")
 
+            self.cli.show_progress("Training model", 100)
+
+            # Use either train_best_model or train_model_pipeline based on user choice
+            if use_best_model and num_runs > 1:
+                from models.trainer import train_best_model
+                model, metrics = train_best_model(self.config, options['timeframe'], num_runs=num_runs)
+                logger.info(f"Completed {num_runs} training iterations to find best model")
+            else:
+                from models.trainer import train_model_pipeline
+                model, metrics = train_model_pipeline(self.config, options['timeframe'])
+
+            # Display results
             results = {
                 "Status": "Success",
                 "Model Type": options['model_type'],
                 "Timeframe": options['timeframe']
             }
+
+            if use_best_model and num_runs > 1:
+                results["Training Method"] = f"Best of {num_runs} iterations"
+
             if 'test' in metrics:
                 test_metrics = metrics['test']
                 if 'test_accuracy' in test_metrics:
@@ -286,7 +336,7 @@ class TradingBotApp:
             if self.cli.confirm_action("view detailed backtest visualizations"):
                 from models.visualization import visualize_backtest_results
                 storage = DataStorage()
-                models_dir = os.path.join(storage.base_path, "../models")
+                models_dir = os.path.join(storage.base_path, "../data_output/trained_models")
                 backtest_files = [f for f in os.listdir(models_dir)
                                   if "_backtest_" in f and f.endswith('.pkl')]
                 if backtest_files:
@@ -346,7 +396,7 @@ class TradingBotApp:
             ]
         )
         storage = DataStorage()
-        models_dir = os.path.join(storage.base_path, "../models")
+        models_dir = os.path.join(storage.base_path, "../data_output/trained_models")
         if not os.path.exists(models_dir):
             self.cli.show_results("Error", {"Status": "No models directory found"})
             return

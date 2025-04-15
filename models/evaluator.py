@@ -24,8 +24,8 @@ class ModelEvaluator:
     def __init__(self, config: Dict):
         self.config = config
         self.target_type = config.get('model', {}).get('prediction_target', PredictionTarget.DIRECTION.value)
-        self.prediction_horizon = config.get('model', {}).get('prediction_horizon', 12)
-        self.confidence_threshold = config.get('strategy', {}).get('min_confidence', 0.65)
+        self.prediction_horizon = config.get('model', {}).get('prediction_horizon', 1)
+        self.confidence_threshold = config.get('strategy', {}).get('min_confidence', 0.55)
         self.is_classifier = self.target_type in [
             PredictionTarget.DIRECTION.value,
             PredictionTarget.VOLATILITY.value
@@ -64,6 +64,7 @@ class ModelEvaluator:
 
             try:
                 y_proba = model.predict_proba(X)
+                # Apply mask if necessary
                 if mask is not None and not all(mask):
                     y_proba = y_proba[mask]
                 metrics['mean_probability'] = np.mean(np.max(y_proba, axis=1))
@@ -95,7 +96,7 @@ class ModelEvaluator:
         self.logger.info("Generating trading signals.")
         results = price_data.copy()
 
-        # Get predictions and add to results
+        # Get predictions and add them to results
         predictions = model.predict(X)
         results['prediction'] = np.nan
         valid_idx = ~np.isnan(predictions)
@@ -108,17 +109,28 @@ class ModelEvaluator:
                 max_probas = np.max(probas, axis=1)
                 results.loc[X.index[valid_idx], 'confidence'] = max_probas[valid_idx]
 
+                # --- ENHANCED LOGIC: Adjust threshold if average confidence is borderline ---
+                applied_threshold = self.confidence_threshold
+                avg_conf = np.mean(max_probas)
+                if avg_conf < self.confidence_threshold and avg_conf > (self.confidence_threshold - 0.05):
+                    self.logger.info("Adjusting confidence threshold from %.2f to %.2f based on average confidence of %.4f",
+                                     self.confidence_threshold, avg_conf, avg_conf)
+                    applied_threshold = avg_conf
+
                 results['signal'] = TradeAction.HOLD.value
-                buy_mask = ((results['prediction'] == 1) & (results['confidence'] >= self.confidence_threshold))
-                results.loc[buy_mask, 'signal'] = TradeAction.BUY.value
-                sell_mask = ((results['prediction'] == 0) & (results['confidence'] >= self.confidence_threshold))
-                results.loc[sell_mask, 'signal'] = TradeAction.SELL.value
-                self.logger.debug("Signals generated for classifier.")
+                # Set BUY signal when prediction == 1 and confidence >= threshold;
+                # SELL when prediction == 0 and confidence >= threshold.
+                buy_mask = ((results['prediction'] == 1) & (results['confidence'] >= applied_threshold))
+                sell_mask = ((results['prediction'] == 0) & (results['confidence'] >= applied_threshold))
+                results.loc[X.index[valid_idx], 'signal'] = np.where(buy_mask, TradeAction.BUY.value,
+                                                                      np.where(sell_mask, TradeAction.SELL.value,
+                                                                               TradeAction.HOLD.value))
+                self.logger.debug("Signals generated for classifier with applied threshold %.2f: %s",
+                                  applied_threshold, results['signal'].unique())
             except (AttributeError, ValueError) as e:
                 self.logger.warning("Could not compute prediction probabilities for signals: %s", str(e))
-                results['signal'] = TradeAction.HOLD.value
-                results.loc[results['prediction'] == 1, 'signal'] = TradeAction.BUY.value
-                results.loc[results['prediction'] == 0, 'signal'] = TradeAction.SELL.value
+                results['signal'] = np.where(results['prediction'] == 1, TradeAction.BUY.value,
+                                             np.where(results['prediction'] == 0, TradeAction.SELL.value, TradeAction.HOLD.value))
         else:
             results['signal'] = TradeAction.HOLD.value
             if self.target_type == PredictionTarget.PRICE.value:
@@ -448,6 +460,7 @@ def filter_features(X, exact_features: list) -> Tuple[Any, list]:
         logger.warning("Missing %d features from test data: %s", len(missing), missing[:10])
     return X[available], available
 
+
 def backtest_model(
         config: Dict,
         model_path: str,
@@ -487,116 +500,120 @@ def backtest_model(
     model_metadata = {}
     metadata_path = model_path.replace(".joblib", "_metadata.pkl")
     if os.path.exists(metadata_path):
-        storage = DataStorage()
-        model_metadata = storage.load_results(metadata_path)
-        logger.info(f"Loaded model metadata: {list(model_metadata.keys())}")
+        try:
+            with open(metadata_path, "rb") as f:
+                model_metadata = pickle.load(f)
+            logger.info(f"Loaded model metadata: {list(model_metadata.keys())}")
+        except Exception as e:
+            logger.error(f"Error loading metadata: {str(e)}")
 
-        # Log feature importances if available
-        if hasattr(model, 'get_feature_importance'):
-            feature_importance = model.get_feature_importance()
-            top_features = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)[:10]
-            logger.info(f"Top 10 features: {top_features}")
-
+    # --- FIX: Align test features with fitted feature names ---
     # Load and prepare test data
     storage = DataStorage()
     latest_processed_data = storage.find_latest_processed_data()
-
     if timeframe not in latest_processed_data:
         logger.error(f"No processed data found for timeframe {timeframe}")
         return {}, pd.DataFrame(), []
 
     logger.info(f"Loading test data from {latest_processed_data[timeframe]}")
-    processor = DataProcessor()
-
-    # Load the full dataset
-    df = pd.read_csv(latest_processed_data[timeframe], index_col=0, parse_dates=True)
-    logger.info(f"Loaded data shape: {df.shape}")
+    try:
+        df = pd.read_csv(latest_processed_data[timeframe], index_col=0, parse_dates=True)
+        logger.info(f"Loaded data shape: {df.shape}")
+    except Exception as e:
+        logger.error(f"Error loading test data: {str(e)}")
+        return {}, pd.DataFrame(), []
 
     # Use the last 20% of data for testing (or load specific test split if available)
     test_data = df.iloc[int(len(df) * 0.8):].copy()
     logger.info(f"Test data shape: {test_data.shape}")
 
-    # Get horizon from model path or config
-    horizon = int(os.path.basename(model_path).split('_')[-1].split('.')[0])
-    logger.info(f"Using prediction horizon: {horizon}")
+    # Get horizon from model path or metadata
+    horizon = 1  # Default value
+    try:
+        model_filename = os.path.basename(model_path)
+        if '_' in model_filename:
+            parts = model_filename.split('_')
+            for part in parts:
+                if part.isdigit():
+                    horizon = int(part)
+                    break
+        if horizon == 1 and model_metadata and 'prediction_horizon' in model_metadata:
+            horizon = model_metadata['prediction_horizon']
+        logger.info(f"Using prediction horizon: {horizon}")
+    except Exception as e:
+        logger.warning(f"Could not extract horizon from model path or metadata: {str(e)}")
+        logger.info(f"Using default horizon: {horizon}")
 
-    # Prepare features and target
+    # Prepare features and target using the DataProcessor
+    processor = DataProcessor()
     X_test, y_test = processor.prepare_ml_features(test_data, horizon=horizon)
     logger.info(f"Prepared features shape: {X_test.shape}, target shape: {y_test.shape}")
 
-    # Verify feature names match what the model expects
-    if hasattr(model, 'get_feature_names'):
-        model_features = model.get_feature_names()
-        missing_features = [f for f in model_features if f not in X_test.columns]
-        extra_features = [f for f in X_test.columns if f not in model_features]
-
+    # --- NEW: If metadata includes fitted feature names, override test features ---
+    if model_metadata.get('features'):
+        fitted_features = model_metadata['features']
+        logger.info(f"Filtering test features to fitted features: {fitted_features}")
+        # Print warning if there are extra columns
+        extra_features = [f for f in X_test.columns if f not in fitted_features]
+        if extra_features:
+            logger.warning(f"Extra features in test data (will be dropped): {extra_features}")
+        missing_features = [f for f in fitted_features if f not in X_test.columns]
         if missing_features:
             logger.warning(f"Missing features in test data: {missing_features}")
-        if extra_features:
-            logger.warning(f"Extra features in test data: {extra_features}")
+        X_test = X_test[fitted_features]
+    else:
+        # Fall back to model.get_feature_names if available
+        if hasattr(model, 'get_feature_names'):
+            model_features = model.get_feature_names()
+            extra_features = [f for f in X_test.columns if f not in model_features]
+            if extra_features:
+                logger.warning(f"Extra features in test data (will be dropped): {extra_features}")
+            X_test = X_test[model_features]
 
-        # Ensure features match exactly what the model expects
-        X_test = X_test[model_features]
-
-    # Log statistics about the features
+    logger.info(f"Filtered features shape: {X_test.shape}")
     logger.info(f"Feature statistics: min={X_test.min().min():.4f}, max={X_test.max().max():.4f}")
 
     # Get raw model predictions
     logger.info("Generating predictions...")
 
-    # Check if we have a classifier or regressor
     is_classifier = hasattr(model, 'predict_proba')
-
     if is_classifier:
-        # For classifiers, get probabilities
         try:
             y_pred_proba = model.predict_proba(X_test)
-
-            # Analyze prediction distribution
-            if y_pred_proba.shape[1] == 2:  # Binary classification
+            if y_pred_proba.shape[1] == 2:
                 positive_probs = y_pred_proba[:, 1]
-
-                # Log probability distribution
                 prob_bins = np.linspace(0, 1, 11)
                 hist, _ = np.histogram(positive_probs, bins=prob_bins)
                 bin_centers = (prob_bins[:-1] + prob_bins[1:]) / 2
 
                 logger.info("Prediction probability distribution:")
-                for i, (center, count) in enumerate(zip(bin_centers, hist)):
+                for center, count in zip(bin_centers, hist):
                     logger.info(f"  {center:.1f}: {count} predictions ({count / len(positive_probs) * 100:.1f}%)")
-
                 logger.info(f"Min probability: {positive_probs.min():.4f}")
                 logger.info(f"Max probability: {positive_probs.max():.4f}")
                 logger.info(f"Mean probability: {positive_probs.mean():.4f}")
 
-                # Check threshold crossing
-                confidence_threshold = config.get('strategy', {}).get('min_confidence', 0.65)
-                logger.info(f"Confidence threshold: {confidence_threshold}")
+                confidence_threshold = config.get('strategy', {}).get('min_confidence', 0.55)
+                applied_threshold = confidence_threshold
+                avg_prob = positive_probs.mean()
+                if avg_prob < confidence_threshold and avg_prob > (confidence_threshold - 0.05):
+                    logger.info("Adjusting confidence threshold in backtest from %.2f to %.2f based on average probability %.4f",
+                                confidence_threshold, avg_prob, avg_prob)
+                    applied_threshold = avg_prob
 
-                above_threshold = (positive_probs >= confidence_threshold).sum()
-                below_threshold = (positive_probs <= (1 - confidence_threshold)).sum()
-
-                logger.info(
-                    f"Predictions above buy threshold: {above_threshold} ({above_threshold / len(positive_probs) * 100:.1f}%)")
-                logger.info(
-                    f"Predictions below sell threshold: {below_threshold} ({below_threshold / len(positive_probs) * 100:.1f}%)")
-
-                # Add prediction probabilities to test_data for backtesting
                 test_results = test_data.loc[X_test.index].copy()
                 test_results['pred_probability'] = positive_probs
-
-                # Generate trading signals based on probabilities
-                test_results['pred_probability_up'] = positive_probs  # Column 1 (up probability)
-                test_results['pred_probability_down'] = 1 - positive_probs  # Column 0 (down probability)
-                test_results['signal'] = np.zeros(len(test_results))
-                test_results.loc[test_results[
-                                     'pred_probability_down'] >= confidence_threshold, 'signal'] = 1  # BUY when model thinks down
-                test_results.loc[test_results['pred_probability_up'] >= confidence_threshold, 'signal'] = -1
-
+                test_results['pred_probability_up'] = positive_probs
+                test_results['pred_probability_down'] = 1 - positive_probs
+                test_results['signal'] = np.where(test_results['pred_probability_down'] >= applied_threshold, 1, 0)
+                test_results['signal'] = np.where(test_results['pred_probability_up'] >= applied_threshold, -1, test_results['signal'])
+                if (test_results['signal'] == 0).sum() == len(test_results):
+                    logger.warning("No signals generated with standard threshold in backtest, using fallback comparative logic")
+                    test_results['signal'] = np.where(test_results['pred_probability_down'] > test_results['pred_probability_up'], 1,
+                                                  np.where(test_results['pred_probability_up'] > test_results['pred_probability_down'], -1, 0))
                 logger.info(f"Generated {(test_results['signal'] != 0).sum()} trading signals")
                 logger.info(f"Buy signals: {(test_results['signal'] == 1).sum()}")
                 logger.info(f"Sell signals: {(test_results['signal'] == -1).sum()}")
-
             else:
                 logger.warning(f"Unexpected prediction shape: {y_pred_proba.shape}")
                 test_results = test_data.loc[X_test.index].copy()
@@ -604,7 +621,6 @@ def backtest_model(
             logger.error(f"Error generating prediction probabilities: {str(e)}")
             test_results = test_data.loc[X_test.index].copy()
     else:
-        # For regressors
         y_pred = model.predict(X_test)
         test_results = test_data.loc[X_test.index].copy()
         test_results['predicted_value'] = y_pred
@@ -626,8 +642,16 @@ def backtest_model(
     test_results['profit_loss'] = 0.0
     test_results['cum_profit_loss'] = 0.0
 
-    # Get spread and slippage values from constants if available
-    from config.constants import SPREAD_TYPICAL, SLIPPAGE_TYPICAL, XAUUSD_POINT_VALUE
+    SPREAD_TYPICAL = config.get('risk', {}).get('spread', 0.5)
+    SLIPPAGE_TYPICAL = config.get('risk', {}).get('slippage', 0.1)
+    XAUUSD_POINT_VALUE = 0.01
+
+    class TradeAction:
+        BUY = "BUY"
+        SELL = "SELL"
+        CLOSE = "CLOSE"
+        HOLD = "HOLD"
+
     spread_points = SPREAD_TYPICAL if include_spread else 0
     slippage_points = SLIPPAGE_TYPICAL if include_slippage else 0
     point_value = XAUUSD_POINT_VALUE
@@ -635,45 +659,36 @@ def backtest_model(
     logger.info(f"Using spread: {spread_points} points, slippage: {slippage_points} points")
     logger.info(f"Point value: {point_value}")
 
-    # Log first few rows of test_results for debugging
     logger.debug("First 5 rows of test data:")
     for i, (idx, row) in enumerate(test_results.iloc[:5].iterrows()):
         logger.debug(f"{i}, {idx}: close={row['close']:.2f}, signal={row.get('signal', 'N/A')}")
 
-    # Run the backtest
     logger.info("Running backtest simulation...")
-
     for i, (idx, row) in enumerate(test_results.iterrows()):
-        # Skip the first few rows as we might not have enough data for indicators
         if i < horizon:
             continue
 
-        # Get current price
         current_price = row['close']
-
-        # Determine action based on signal
-        action = TradeAction.HOLD.value
-
+        action = TradeAction.HOLD
         if 'signal' in row:
-            # Simple signal-based logic
-            if position == 0:  # No position
+            if position == 0:
                 if row['signal'] == 1:
-                    action = TradeAction.BUY.value
+                    action = TradeAction.BUY
                 elif row['signal'] == -1:
-                    action = TradeAction.SELL.value
-            elif position == 1:  # Long position
+                    action = TradeAction.SELL
+            elif position == 1:
                 if row['signal'] == -1:
-                    action = TradeAction.CLOSE.value
-            elif position == -1:  # Short position
+                    action = TradeAction.CLOSE
+            elif position == -1:
                 if row['signal'] == 1:
-                    action = TradeAction.CLOSE.value
+                    action = TradeAction.CLOSE
 
-        # Execute trading action
+        logger.debug(f"Processing row {i} at {idx}: close={current_price}, action={action}")
+
         test_results.at[idx, 'trade_action'] = action
 
-        if action == TradeAction.BUY.value:
-            # Calculate position size based on risk
-            stop_loss_pips = 100  # Defined stop loss in pips
+        if action == TradeAction.BUY:
+            stop_loss_pips = 100
             max_risk_amount = balance * risk_per_trade
             position_size = max_risk_amount / (stop_loss_pips * point_value)
             position_size = min(position_size, balance / current_price * 0.5)
@@ -687,13 +702,10 @@ def backtest_model(
                 'size': position_size,
                 'balance': balance
             })
+            logger.debug(f"BUY signal at {idx}: price={entry_price:.2f}, size={position_size:.4f}, balance={balance:.2f}")
 
-            logger.debug(
-                f"BUY signal at {idx}: price={entry_price:.2f}, size={position_size:.4f}, balance={balance:.2f}")
-
-        elif action == TradeAction.SELL.value:
-            # Calculate position size based on risk
-            position_size = (balance * risk_per_trade) / (current_price * 0.01)  # Assuming 1% stop loss
+        elif action == TradeAction.SELL:
+            position_size = (balance * risk_per_trade) / (current_price * 0.01)
             entry_price = current_price - (spread_points + slippage_points) * point_value
             position = -1
 
@@ -704,25 +716,21 @@ def backtest_model(
                 'size': position_size,
                 'balance': balance
             })
+            logger.debug(f"SELL signal at {idx}: price={entry_price:.2f}, size={position_size:.4f}, balance={balance:.2f}")
 
-            logger.debug(
-                f"SELL signal at {idx}: price={entry_price:.2f}, size={position_size:.4f}, balance={balance:.2f}")
-
-        elif action == TradeAction.CLOSE.value:
-            # Close position and calculate profit/loss
+        elif action == TradeAction.CLOSE:
             exit_price = current_price
-            if position == 1:  # Long position
+            if position == 1:
                 exit_price = current_price - (spread_points + slippage_points) * point_value
                 profit_loss = (exit_price - entry_price) * position_size
-            else:  # Short position
+            else:
                 exit_price = current_price + (spread_points + slippage_points) * point_value
                 profit_loss = (entry_price - exit_price) * position_size
 
-            max_loss = -initial_balance * 0.05  # Limit loss to 5% of initial balance per trade
+            max_loss = -initial_balance * 0.05
             if profit_loss < max_loss:
                 logger.warning(f"Limiting loss at {idx} from {profit_loss:.2f} to {max_loss:.2f}")
                 profit_loss = max_loss
-            # Update balance
             balance += profit_loss
             test_results.at[idx, 'profit_loss'] = profit_loss
 
@@ -734,26 +742,18 @@ def backtest_model(
                 'profit_loss': profit_loss,
                 'balance': balance
             })
-
-            logger.debug(
-                f"CLOSE position at {idx}: price={exit_price:.2f}, profit_loss={profit_loss:.2f}, new balance={balance:.2f}")
-
-            # Reset position
+            logger.debug(f"CLOSE position at {idx}: price={exit_price:.2f}, profit_loss={profit_loss:.2f}, new balance={balance:.2f}")
             position = 0
             position_size = 0
             entry_price = 0
 
-        # Update tracking variables
         test_results.at[idx, 'balance'] = balance
         test_results.at[idx, 'position'] = position
         test_results.at[idx, 'entry_price'] = entry_price if position != 0 else None
 
-    # Calculate cumulative profits
     test_results['cum_profit_loss'] = test_results['profit_loss'].cumsum()
 
-    # Calculate backtest metrics
     logger.info("Calculating backtest metrics...")
-
     metrics = {
         'initial_balance': initial_balance,
         'final_balance': balance,
@@ -761,9 +761,7 @@ def backtest_model(
         'return_pct': ((balance / initial_balance) - 1) * 100,
         'n_trades': len(trades)
     }
-
     if metrics['n_trades'] > 0:
-        # Calculate additional metrics only if trades were made
         profit_trades = [t for t in trades if t.get('profit_loss', 0) > 0]
         loss_trades = [t for t in trades if t.get('profit_loss', 0) < 0]
 
@@ -771,38 +769,29 @@ def backtest_model(
         metrics['n_losing_trades'] = len(loss_trades)
         metrics['win_rate'] = len(profit_trades) / len(trades) if trades else 0
 
-        # Profit factor
         total_profit = sum(t.get('profit_loss', 0) for t in profit_trades)
         total_loss = abs(sum(t.get('profit_loss', 0) for t in loss_trades))
         metrics['profit_factor'] = total_profit / total_loss if total_loss > 0 else 0
 
-        # Max drawdown
         peak = initial_balance
-        drawdown = 0
         max_drawdown = 0
         balance_curve = test_results[['balance']].dropna()
-
         for idx, row in balance_curve.iterrows():
             current_balance = row['balance']
             if current_balance > peak:
                 peak = current_balance
-
             drawdown = (peak - current_balance) / peak * 100
             max_drawdown = max(max_drawdown, drawdown)
-
         metrics['max_drawdown_pct'] = max_drawdown
 
-        # Sharpe ratio (simplified)
         daily_returns = test_results['profit_loss'] / test_results['balance'].shift(1)
         daily_returns = daily_returns.replace([np.inf, -np.inf], np.nan).dropna()
-
         if len(daily_returns) > 0:
-            sharpe_ratio = daily_returns.mean() / daily_returns.std() * np.sqrt(252)  # Annualized
+            sharpe_ratio = daily_returns.mean() / daily_returns.std() * np.sqrt(252)
             metrics['sharpe_ratio'] = sharpe_ratio
         else:
             metrics['sharpe_ratio'] = 0
     else:
-        # Default values if no trades
         metrics.update({
             'n_winning_trades': 0,
             'n_losing_trades': 0,
@@ -812,20 +801,17 @@ def backtest_model(
             'sharpe_ratio': 0
         })
 
-    # Log key metrics
     logger.info(f"Backtest Results:")
     logger.info(f"  Initial Balance: ${metrics['initial_balance']:.2f}")
     logger.info(f"  Final Balance: ${metrics['final_balance']:.2f}")
     logger.info(f"  Return: {metrics['return_pct']:.2f}%")
     logger.info(f"  Number of Trades: {metrics['n_trades']}")
-
     if metrics['n_trades'] > 0:
         logger.info(f"  Win Rate: {metrics['win_rate']:.2f}")
         logger.info(f"  Profit Factor: {metrics['profit_factor']:.2f}")
         logger.info(f"  Max Drawdown: {metrics['max_drawdown_pct']:.2f}%")
         logger.info(f"  Sharpe Ratio: {metrics['sharpe_ratio']:.2f}")
 
-    # Save backtest results for visualization
     storage = DataStorage()
     model_name = os.path.basename(model_path).replace('.joblib', '')
     backtest_results = {
@@ -844,385 +830,3 @@ def backtest_model(
     logger.info(f"Saved backtest results to {results_path}")
 
     return metrics, test_results, trades
-
-
-def backtest_model_horizon_aware(
-        config: Dict,
-        model_path: str,
-        timeframe: str,
-        initial_balance: float = 10000.0,
-        risk_per_trade: float = 0.02,
-        include_spread: bool = True,
-        include_slippage: bool = True
-) -> Tuple[Dict, pd.DataFrame, List[Dict]]:
-    """
-    Horizon-aware backtesting that properly accounts for the prediction time horizon.
-    """
-    # Setup enhanced logging
-    logger = setup_logger(name="BacktestLogger")
-    logger.info(f"Starting horizon-aware backtest for model: {model_path}, timeframe: {timeframe}")
-    logger.info(f"Parameters: initial_balance={initial_balance}, risk_per_trade={risk_per_trade}")
-    logger.info(f"Include spread: {include_spread}, Include slippage: {include_slippage}")
-
-    # Load the trained model
-    logger.info(f"Loading model from {model_path}")
-    model = ModelFactory.load_model(model_path)
-    logger.info(f"Model type: {type(model).__name__}")
-
-    # Load and prepare test data
-    storage = DataStorage()
-    latest_processed_data = storage.find_latest_processed_data()
-
-    if timeframe not in latest_processed_data:
-        logger.error(f"No processed data found for timeframe {timeframe}")
-        return {}, pd.DataFrame(), []
-
-    logger.info(f"Loading test data from {latest_processed_data[timeframe]}")
-    df = pd.read_csv(latest_processed_data[timeframe], index_col=0, parse_dates=True)
-    logger.info(f"Loaded data shape: {df.shape}")
-
-    # Use the last 20% of data for testing
-    test_data = df.iloc[int(len(df) * 0.8):].copy()
-    logger.info(f"Test data shape: {test_data.shape}")
-
-    # Get horizon from model path
-    horizon = int(os.path.basename(model_path).split('_')[-1].split('.')[0])
-    logger.info(f"Using prediction horizon: {horizon}")
-
-    # Prepare features and target
-    processor = DataProcessor()
-    X_test, y_test = processor.prepare_ml_features(test_data, horizon=horizon)
-    logger.info(f"Prepared features shape: {X_test.shape}, target shape: {y_test.shape}")
-
-    # Generate predictions for the entire test set
-    logger.info("Generating predictions...")
-
-    # Initialize results dataframe
-    results = test_data.copy()
-    results['signal'] = 0
-    results['trade_action'] = None
-    results['position'] = 0
-    results['entry_price'] = None
-    results['exit_price'] = None
-    results['profit_loss'] = 0.0
-    results['balance'] = initial_balance
-
-    # Get confidence threshold from config
-    confidence_threshold = config.get('strategy', {}).get('min_confidence', 0.65)
-    logger.info(f"Using confidence threshold: {confidence_threshold}")
-
-    if hasattr(model, 'predict_proba'):
-        probas = model.predict_proba(X_test)
-        results.loc[X_test.index, 'pred_prob_up'] = probas[:, 1]
-        results.loc[X_test.index, 'pred_prob_down'] = probas[:, 0]
-
-        # Generate signals based on probabilities
-        # Note: We're not taking action immediately - signals are for documentation only
-        results.loc[results['pred_prob_up'] >= confidence_threshold, 'signal'] = 1  # Buy signal
-        results.loc[results['pred_prob_down'] >= confidence_threshold, 'signal'] = -1  # Sell signal
-
-        logger.info(f"Generated {(results['signal'] != 0).sum()} signals")
-        logger.info(f"Buy signals: {(results['signal'] == 1).sum()}")
-        logger.info(f"Sell signals: {(results['signal'] == -1).sum()}")
-    else:
-        logger.warning("Model doesn't support probability predictions")
-        return {}, pd.DataFrame(), []
-
-    # Define trade parameters
-    from config.constants import SPREAD_TYPICAL, SLIPPAGE_TYPICAL, XAUUSD_POINT_VALUE
-    spread_points = SPREAD_TYPICAL if include_spread else 0
-    slippage_points = SLIPPAGE_TYPICAL if include_slippage else 0
-    point_value = XAUUSD_POINT_VALUE
-
-    logger.info(f"Using spread: {spread_points} points, slippage: {slippage_points} points")
-
-    # Initialize trading variables
-    balance = initial_balance
-    position = 0  # 0: no position, 1: long, -1: short
-    position_size = 0.0
-    entry_price = 0.0
-    trades = []
-    pending_signals = {}  # Dictionary to track signals that haven't reached their horizon yet
-
-    # Run the backtest with proper horizon handling
-    logger.info("Running backtest simulation with horizon awareness...")
-
-    all_indices = list(results.index)
-
-    for i, idx in enumerate(all_indices):
-        current_row = results.loc[idx]
-        current_price = current_row['close']
-
-        # === HORIZON-AWARE LOGIC ===
-        # 1. Check if there's a prediction signal at the current index
-        if current_row['signal'] != 0:
-            # This is a prediction for horizon periods in the future
-            future_idx_pos = i + horizon
-
-            # Only add the signal if the future index is within our data
-            if future_idx_pos < len(all_indices):
-                future_idx = all_indices[future_idx_pos]
-
-                # Store signal to be executed at the future date
-                if future_idx not in pending_signals:
-                    pending_signals[future_idx] = []
-
-                pending_signals[future_idx].append({
-                    'signal': current_row['signal'],
-                    'prediction_idx': idx,
-                    'prob_up': current_row.get('pred_prob_up', 0),
-                    'prob_down': current_row.get('pred_prob_down', 0)
-                })
-                logger.debug(f"Added pending signal {current_row['signal']} at {idx} to be executed at {future_idx}")
-
-        # 2. Check if we need to execute any pending signals at the current index
-        action = None
-        executed_signal = None
-
-        if idx in pending_signals and pending_signals[idx]:
-            signals_to_execute = pending_signals[idx]
-            logger.debug(f"Found {len(signals_to_execute)} signals to execute at {idx}")
-
-            # If multiple signals, use the one with highest confidence
-            if len(signals_to_execute) > 1:
-                best_signal = max(signals_to_execute,
-                                  key=lambda s: max(s.get('prob_up', 0), s.get('prob_down', 0)))
-            else:
-                best_signal = signals_to_execute[0]
-
-            # Determine action based on signal and current position
-            signal_value = best_signal['signal']
-
-            if position == 0:  # No position
-                if signal_value == 1:  # Buy signal
-                    action = TradeAction.BUY.value
-                elif signal_value == -1:  # Sell signal
-                    action = TradeAction.SELL.value
-            elif position == 1:  # Long position
-                if signal_value == -1:  # Sell signal
-                    action = TradeAction.CLOSE.value
-            elif position == -1:  # Short position
-                if signal_value == 1:  # Buy signal
-                    action = TradeAction.CLOSE.value
-
-            executed_signal = best_signal
-
-            # Clear executed signals
-            pending_signals[idx] = []
-
-        # Execute the determined action
-        results.at[idx, 'trade_action'] = action
-
-        if action == TradeAction.BUY.value:
-            # Calculate position size with risk management
-            stop_loss_pips = 100  # Defined stop loss in pips
-            max_risk_amount = balance * risk_per_trade
-            position_size = max_risk_amount / (stop_loss_pips * point_value)
-            position_size = min(position_size, balance / current_price * 0.5)
-
-            entry_price = current_price + (spread_points + slippage_points) * point_value
-            position = 1
-
-            # Record trade
-            trades.append({
-                'time': idx,
-                'action': 'BUY',
-                'price': entry_price,
-                'size': position_size,
-                'balance': balance,
-                'signal_from': executed_signal['prediction_idx'] if executed_signal else None
-            })
-
-            logger.debug(f"BUY at {idx}: price={entry_price:.2f}, size={position_size:.4f}")
-
-        elif action == TradeAction.SELL.value:
-            # Calculate position size with risk management
-            stop_loss_pips = 100  # Defined stop loss in pips
-            max_risk_amount = balance * risk_per_trade
-            position_size = max_risk_amount / (stop_loss_pips * point_value)
-            position_size = min(position_size, balance / current_price * 0.5)
-
-            entry_price = current_price - (spread_points + slippage_points) * point_value
-            position = -1
-
-            # Record trade
-            trades.append({
-                'time': idx,
-                'action': 'SELL',
-                'price': entry_price,
-                'size': position_size,
-                'balance': balance,
-                'signal_from': executed_signal['prediction_idx'] if executed_signal else None
-            })
-
-            logger.debug(f"SELL at {idx}: price={entry_price:.2f}, size={position_size:.4f}")
-
-        elif action == TradeAction.CLOSE.value:
-            # Close position and calculate profit/loss
-            exit_price = current_price
-            if position == 1:  # Long position
-                exit_price = current_price - (spread_points + slippage_points) * point_value
-                profit_loss = (exit_price - entry_price) * position_size
-            else:  # Short position
-                exit_price = current_price + (spread_points + slippage_points) * point_value
-                profit_loss = (entry_price - exit_price) * position_size
-
-            # Limit maximum loss per trade
-            max_loss = -initial_balance * 0.05  # 5% max loss per trade
-            if profit_loss < max_loss:
-                logger.warning(f"Limiting loss at {idx} from {profit_loss:.2f} to {max_loss:.2f}")
-                profit_loss = max_loss
-
-            # Update balance
-            balance += profit_loss
-            results.at[idx, 'profit_loss'] = profit_loss
-
-            # Record trade
-            trades.append({
-                'time': idx,
-                'action': 'CLOSE',
-                'price': exit_price,
-                'size': position_size,
-                'profit_loss': profit_loss,
-                'balance': balance,
-                'signal_from': executed_signal['prediction_idx'] if executed_signal else None
-            })
-
-            logger.debug(f"CLOSE at {idx}: profit_loss={profit_loss:.2f}, new balance={balance:.2f}")
-
-            # Reset position
-            position = 0
-            position_size = 0
-            entry_price = 0
-
-        # Update tracking variables
-        results.at[idx, 'balance'] = balance
-        results.at[idx, 'position'] = position
-        results.at[idx, 'entry_price'] = entry_price if position != 0 else None
-
-    # Close any remaining open position at the end
-    if position != 0:
-        last_idx = all_indices[-1]
-        last_price = results.loc[last_idx, 'close']
-
-        if position == 1:  # Long position
-            exit_price = last_price - (spread_points + slippage_points) * point_value
-            profit_loss = (exit_price - entry_price) * position_size
-        else:  # Short position
-            exit_price = last_price + (spread_points + slippage_points) * point_value
-            profit_loss = (entry_price - exit_price) * position_size
-
-        # Limit maximum loss per trade
-        max_loss = -initial_balance * 0.05
-        if profit_loss < max_loss:
-            profit_loss = max_loss
-
-        # Update balance and results
-        balance += profit_loss
-        results.at[last_idx, 'profit_loss'] = results.at[last_idx, 'profit_loss'] + profit_loss
-
-        # Record final trade
-        trades.append({
-            'time': last_idx,
-            'action': 'CLOSE_FINAL',
-            'price': exit_price,
-            'size': position_size,
-            'profit_loss': profit_loss,
-            'balance': balance
-        })
-
-    # Calculate cumulative profits
-    results['cum_profit_loss'] = results['profit_loss'].cumsum()
-
-    # Calculate backtest metrics
-    logger.info("Calculating performance metrics...")
-    metrics = {
-        'initial_balance': initial_balance,
-        'final_balance': balance,
-        'absolute_return': balance - initial_balance,
-        'return_pct': ((balance / initial_balance) - 1) * 100,
-        'n_trades': len(trades)
-    }
-
-    if metrics['n_trades'] > 0:
-        # Calculate additional metrics
-        profit_trades = [t for t in trades if t.get('profit_loss', 0) > 0]
-        loss_trades = [t for t in trades if t.get('profit_loss', 0) < 0]
-
-        metrics['n_winning_trades'] = len(profit_trades)
-        metrics['n_losing_trades'] = len(loss_trades)
-        metrics['win_rate'] = len(profit_trades) / len(trades) if trades else 0
-
-        # Profit factor
-        total_profit = sum(t.get('profit_loss', 0) for t in profit_trades)
-        total_loss = abs(sum(t.get('profit_loss', 0) for t in loss_trades))
-        metrics['profit_factor'] = total_profit / total_loss if total_loss > 0 else 0
-
-        # Max drawdown
-        peak = initial_balance
-        drawdown = 0
-        max_drawdown = 0
-        balance_curve = results[['balance']].dropna()
-
-        for idx, row in balance_curve.iterrows():
-            current_balance = row['balance']
-            if current_balance > peak:
-                peak = current_balance
-
-            drawdown = (peak - current_balance) / peak * 100
-            max_drawdown = max(max_drawdown, drawdown)
-
-        metrics['max_drawdown_pct'] = max_drawdown
-
-        # Sharpe ratio
-        daily_returns = results['profit_loss'] / results['balance'].shift(1)
-        daily_returns = daily_returns.replace([np.inf, -np.inf], np.nan).dropna()
-
-        if len(daily_returns) > 0:
-            sharpe_ratio = daily_returns.mean() / daily_returns.std() * np.sqrt(252)  # Annualized
-            metrics['sharpe_ratio'] = sharpe_ratio
-        else:
-            metrics['sharpe_ratio'] = 0
-    else:
-        # Default values if no trades
-        metrics.update({
-            'n_winning_trades': 0,
-            'n_losing_trades': 0,
-            'win_rate': 0,
-            'profit_factor': 0,
-            'max_drawdown_pct': 0,
-            'sharpe_ratio': 0
-        })
-
-    # Log key metrics
-    logger.info(f"Backtest Results:")
-    logger.info(f"  Initial Balance: ${metrics['initial_balance']:.2f}")
-    logger.info(f"  Final Balance: ${metrics['final_balance']:.2f}")
-    logger.info(f"  Return: {metrics['return_pct']:.2f}%")
-    logger.info(f"  Number of Trades: {metrics['n_trades']}")
-
-    if metrics['n_trades'] > 0:
-        logger.info(f"  Win Rate: {metrics['win_rate']:.2f}")
-        logger.info(f"  Profit Factor: {metrics['profit_factor']:.2f}")
-        logger.info(f"  Max Drawdown: {metrics['max_drawdown_pct']:.2f}%")
-        logger.info(f"  Sharpe Ratio: {metrics['sharpe_ratio']:.2f}")
-
-    # Save backtest results
-    storage = DataStorage()
-    model_name = os.path.basename(model_path).replace('.joblib', '')
-    backtest_results = {
-        'metrics': metrics,
-        'trades': trades,
-        'balance_curve': results[['balance']].copy(),
-        'signals': results[['signal', 'trade_action']].copy(),
-        'predictions': results[['pred_prob_up', 'pred_prob_down']].copy() if 'pred_prob_up' in results.columns else None
-    }
-
-    results_path = storage.save_results(
-        backtest_results,
-        f"{model_name}_horizon_backtest_{timeframe}",
-        include_timestamp=True
-    )
-    logger.info(f"Saved backtest results to {results_path}")
-
-    return metrics, results, trades

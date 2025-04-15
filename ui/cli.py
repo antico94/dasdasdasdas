@@ -469,7 +469,7 @@ class TradingBotCLI:
     def _get_available_models(self) -> List[Choice]:
         """Get list of available trained models."""
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        models_dir = os.path.join(project_root, "data", "models")
+        models_dir = os.path.join(project_root, "data_output", "trained_models")
 
         if not os.path.exists(models_dir):
             return []  # Return empty list if no models directory is found
@@ -519,7 +519,17 @@ class TradingBotCLI:
         print(f"\n{title}\n{'=' * len(title)}")
 
         for key, value in results.items():
-            print(f"{key}: {value}")
+            # Special handling for nested dictionaries like model parameters
+            if isinstance(value, dict) and value:
+                print(f"{key}:")
+                for sub_key, sub_value in value.items():
+                    print(f"  - {sub_key}: {sub_value}")
+            # Special handling for None and empty collections
+            elif value is None or (hasattr(value, '__len__') and len(value) == 0):
+                print(f"{key}: None")
+            # Default case for simple values
+            else:
+                print(f"{key}: {value}")
 
         input("\nPress Enter to continue...")
 

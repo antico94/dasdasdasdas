@@ -39,7 +39,7 @@ logger = setup_logger("PredictionAnalyzer")
 def select_model():
     """Let the user select a model using questionary interface."""
     # Find model files
-    models_dir = os.path.join(project_root, "data", "models")
+    models_dir = os.path.join(project_root, "data_output", "trained_models")
     if not os.path.exists(models_dir):
         logger.error("Models directory not found at: " + models_dir)
         return None
@@ -850,7 +850,7 @@ def run_analysis(config):
         processor = DataProcessor()
 
         if config['model_path'] is None:
-            models_dir = os.path.join(project_root, "data", "models")
+            models_dir = os.path.join(project_root, "data_output", "trained_models")
             if os.path.exists(models_dir):
                 model_files = [f for f in os.listdir(models_dir) if
                                f.endswith('.joblib') and not f.endswith('_random_forest.joblib')

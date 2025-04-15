@@ -1,7 +1,7 @@
 data:
   lookback_days: 365
   save_path: data_output/fetched_data_for_training
-  results_path: data_output/results/models
+  results_path: data_output/trained_models
   split_ratio: 0.8
   symbol: XAUUSD
   timeframes:
@@ -45,6 +45,7 @@ model:
   prediction_target: direction
   retraining_frequency: weekly
   type: ensemble
+  use_bayes_optimizer: true  # ADD THIS LINE
 mt5:
   login: 145688
   password: "X9vyB7%90i"
