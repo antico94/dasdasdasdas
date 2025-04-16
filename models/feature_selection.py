@@ -3,7 +3,7 @@ import pandas as pd
 from sklearn.feature_selection import SelectFromModel, SelectKBest, mutual_info_classif
 from sklearn.ensemble import RandomForestClassifier
 import xgboost as xgb
-from typing import List, Tuple
+from typing import List, Tuple, Union, Dict
 
 from utils.logger import setup_logger
 
@@ -189,6 +189,49 @@ class FeatureSelector:
             logger.info(f"...and {len(selected_features) - 10} more features")
 
         return X_train_selected, X_test_selected, selected_features
+
+    def select_features_for_splits(
+            self,
+            X_train: pd.DataFrame,
+            y_train: pd.Series,
+            validation_test_data: Dict[str, Tuple[pd.DataFrame, pd.Series]] = None,
+            method: str = "mutual_info",
+            k: int = None
+    ) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame], List[str]]:
+        """
+        Select features using training data and apply the same selection to validation/test data.
+
+        Parameters:
+            X_train: Training features
+            y_train: Training target
+            validation_test_data: Dictionary with 'validation' and/or 'test' keys, each containing (X, y) tuple
+            method: Feature selection method ('mutual_info', 'random_forest', 'xgboost')
+            k: Number of features to select (if None, use automatic threshold)
+
+        Returns:
+            X_train_selected: Training data with selected features
+            transformed_sets: Dictionary with transformed validation and test sets
+            selected_features: List of selected feature names
+        """
+        logger.info(f"Selecting features for train/validation/test splits using {method} method")
+
+        # Selection is always based only on training data to prevent data leakage
+        X_train_selected, _, selected_features = self.select_features(
+            X_train, y_train, None, method, k
+        )
+
+        # Apply the same feature selection to validation and test data
+        transformed_sets = {}
+
+        if validation_test_data:
+            for split_name, (X, y) in validation_test_data.items():
+                if X is not None:
+                    # Select the same features as in training data
+                    X_selected = X[selected_features].copy()
+                    transformed_sets[split_name] = X_selected
+                    logger.info(f"Applied feature selection to {split_name} data: {X_selected.shape}")
+
+        return X_train_selected, transformed_sets, selected_features
 
     def gold_specific_feature_importance(self, X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
         """

@@ -1,4 +1,6 @@
 import os
+
+import pandas as pd
 import yaml
 import joblib
 
@@ -6,6 +8,7 @@ from config.constants import AppMode
 from data.fetcher import MT5DataFetcher
 from data.processor import DataProcessor
 from data.storage import DataStorage
+from models.trainer import train_model_pipeline
 from ui.cli import TradingBotCLI
 from utils.logger import setup_logger
 
@@ -81,25 +84,33 @@ class TradingBotApp:
                 try:
                     fetcher.config["data"]["timeframes"] = options['timeframes']
                     fetcher.config["data"]["lookback_days"] = options['lookback_days']
-                    self.cli.show_progress("Fetching price data", options['lookback_days'])
-                    data_dict = fetcher.fetch_all_timeframes(lookback_days=options['lookback_days'])
-                    if not data_dict:
+                    self.cli.show_progress("Fetching and splitting price data", options['lookback_days'])
+
+                    # Use the new function to fetch, split and save data
+                    paths = fetcher.fetch_split_and_save()
+
+                    if not paths:
                         self.cli.show_results("Error",
                                               {"Status": "No data retrieved. Check MT5 connection and symbol."})
                         return
-                    fetcher.save_data(data_dict)
 
                     if options['fetch_external']:
                         self.cli.show_progress("Fetching external data", 100)
                         external_data = fetcher.fetch_external_data()
                         fetcher.save_external_data(external_data)
 
-                    latest_mt5_data = fetcher.get_latest_data_paths()
-                    results = {"Status": "Success", "Data saved to": fetcher.config["data"]["save_path"]}
-                    for tf, path in latest_mt5_data.items():
-                        if tf in options['timeframes']:
-                            df = fetcher.load_data({tf: path})[tf]
-                            results[f"{tf} rows"] = len(df)
+                    # Display results
+                    results = {"Status": "Success", "Data split and saved to:":
+                        f"Train: {next(iter(paths.get('train', {}).values()), 'None')}"}
+
+                    # Add more details about the splits
+                    for split_type in ['train', 'validation', 'test']:
+                        if split_type in paths and paths[split_type]:
+                            for tf, path in paths[split_type].items():
+                                if tf in options['timeframes']:
+                                    df = pd.read_csv(path, index_col=0, parse_dates=True)
+                                    results[f"{split_type.capitalize()} {tf} rows"] = len(df)
+
                     self.cli.show_results("Data Fetching Complete", results)
                 finally:
                     fetcher.shutdown()
@@ -136,41 +147,57 @@ class TradingBotApp:
             return
 
         try:
-            latest_mt5_data_paths = self.data_storage.find_latest_data()
-            if not latest_mt5_data_paths:
-                self.cli.show_results("Error", {"Status": "No data found. Please fetch data first."})
+            # Find the latest split data
+            storage = DataStorage()
+            split_paths = storage.find_latest_split_data()
+
+            if not split_paths or not any(split_paths.values()):
+                self.cli.show_results("Error", {"Status": "No split data found. Please fetch data first."})
                 return
 
+            # Find latest external data
             latest_external_data_paths = {}
             for data_source in ["usd_index", "us_10y_yield"]:
-                path = self.data_storage.find_latest_file(f"{data_source}_*.csv")
+                path = storage.find_latest_file(f"{data_source}_*.csv")
                 if path:
                     latest_external_data_paths[data_source] = path
 
             processor = DataProcessor()
             processor.config["model"]["prediction_target"] = options['target_type']
             processor.config["model"]["prediction_horizon"] = options['prediction_horizon']
-            processor.config["data"]["split_ratio"] = options['train_test_split']
 
             self.cli.show_progress("Loading data", 50)
-            data_dict = processor.load_data(latest_mt5_data_paths)
+
+            # Load the split data
+            split_data = processor.load_split_data(split_paths)
             external_data = processor.load_external_data(latest_external_data_paths)
+
             self.cli.show_progress("Processing data", 100)
-            processed_data = processor.process_data(data_dict, external_data)
+
+            # Process each split separately
+            processed_split_data = processor.process_split_data(split_data, external_data)
 
             if options['normalization'] != 'none':
                 self.cli.show_progress("Normalizing data", 50)
-                processed_data = processor.normalize_data(processed_data, method=options['normalization'])
+                processed_split_data = processor.normalize_split_data(processed_split_data,
+                                                                      method=options['normalization'])
 
-            processor.save_processed_data(processed_data)
+            # Save the processed data
+            saved_paths = processor.save_processed_split_data(processed_split_data)
+
+            # Prepare results to display
             results = {
                 "Status": "Success",
                 "Target variable": options['target_type'],
                 "Prediction horizon": options['prediction_horizon'],
                 "Normalization": options['normalization']
             }
-            for tf, df in processed_data.items():
-                results[f"{tf} shape"] = f"{df.shape[0]} rows, {df.shape[1]} columns"
+
+            # Add information about each split
+            for split_name, timeframe_data in processed_split_data.items():
+                for tf, df in timeframe_data.items():
+                    results[f"{split_name.capitalize()} {tf} shape"] = f"{df.shape[0]} rows, {df.shape[1]} columns"
+
             self.cli.show_results("Data Processing Complete", results)
         except Exception as e:
             logger.exception("Error processing data: %s", str(e))
@@ -185,6 +212,16 @@ class TradingBotApp:
             return
 
         try:
+            # Find latest processed split data
+            storage = DataStorage()
+            split_paths = storage.find_latest_split_data()
+
+            if not split_paths or "train" not in split_paths or not split_paths["train"]:
+                self.cli.show_results("Error",
+                                      {"Status": "No processed training data found. Run data processing first."})
+                return
+
+            # Update configuration based on user options
             if not hasattr(self, 'config') or not self.config:
                 project_root = os.path.dirname(os.path.abspath(__file__))
                 config_path = os.path.join(project_root, "config", "config.yaml")
@@ -196,68 +233,18 @@ class TradingBotApp:
                     logger.warning(f"Could not load config file: {str(e)}")
                     self.config = {}
 
+            # Set model configuration options
             if 'model' not in self.config:
                 self.config['model'] = {}
-            if 'data' not in self.config:
-                self.config['data'] = {'split_ratio': 0.8}
-
-            # Set model configuration options
             self.config['model']['type'] = options['model_type']
             self.config['model']['hyperparameter_tuning'] = options['hyperparameter_tuning']
             self.config['model']['feature_selection'] = options['feature_selection']
             self.config['model']['cross_validation'] = options['cross_validation']
-
-            # Add this line to enable using optimized parameters
             self.config['model']['use_bayes_optimizer'] = True
 
-            # Check if optimization file exists and has valid parameters
-            optimized_file = f"{options['model_type']}_H1_direction_1_optimization.pkl"
-            optimized_path = os.path.join("data_output", "trained_models", optimized_file)
-            if os.path.exists(optimized_path):
-                opt_results = joblib.load(optimized_path)
-                best_params = opt_results.get("best_params", {})
-                if not best_params or (isinstance(best_params, dict) and all(not v for v in best_params.values())):
-                    logger.warning(f"Optimization file exists but contains empty parameters: {best_params}")
-                    # Options:
-                    # 1. Regenerate optimization
-                    if self.cli.confirm_action("optimization file contains empty parameters. Run optimization first"):
-                        self._handle_optimize()
-                        return
-                    # 2. Disable use_bayes_optimizer if parameters are empty
-                    else:
-                        self.config['model']['use_bayes_optimizer'] = False
-                        logger.info("Disabled use_bayes_optimizer due to empty parameters")
-
-            if 'prediction_target' not in self.config['model']:
-                self.config['model']['prediction_target'] = 'direction'
-            if 'prediction_horizon' not in self.config['model']:
-                self.config['model']['prediction_horizon'] = 12
-
-            # Ask user if they want to run multiple training iterations for best model
-            num_runs = 1
-            use_best_model = self.cli.confirm_action("run multiple training iterations to find the best model")
-            if use_best_model:
-                # Get number of runs from user (with default of 5)
-                from ui.cli import Choice
-                num_runs_choices = [
-                    Choice("3 runs (faster)", 3),
-                    Choice("5 runs (recommended)", 5),
-                    Choice("10 runs (thorough)", 10),
-                    Choice("20 runs (extensive)", 20)
-                ]
-                num_runs = self.cli.select("Select number of training iterations:", choices=num_runs_choices)
-                logger.info(f"User selected {num_runs} training iterations")
-
+            # Train the model using the updated training pipeline
             self.cli.show_progress("Training model", 100)
-
-            # Use either train_best_model or train_model_pipeline based on user choice
-            if use_best_model and num_runs > 1:
-                from models.trainer import train_best_model
-                model, metrics = train_best_model(self.config, options['timeframe'], num_runs=num_runs)
-                logger.info(f"Completed {num_runs} training iterations to find best model")
-            else:
-                from models.trainer import train_model_pipeline
-                model, metrics = train_model_pipeline(self.config, options['timeframe'])
+            model, metrics = train_model_pipeline(self.config, options['timeframe'])
 
             # Display results
             results = {
@@ -265,9 +252,6 @@ class TradingBotApp:
                 "Model Type": options['model_type'],
                 "Timeframe": options['timeframe']
             }
-
-            if use_best_model and num_runs > 1:
-                results["Training Method"] = f"Best of {num_runs} iterations"
 
             if 'test' in metrics:
                 test_metrics = metrics['test']
@@ -277,8 +261,15 @@ class TradingBotApp:
                 elif 'test_rmse' in test_metrics:
                     results["Test RMSE"] = f"{test_metrics['test_rmse']:.4f}"
                     results["Test R²"] = f"{test_metrics['test_r2']:.4f}"
+
+            if 'final_test' in metrics:
+                final_metrics = metrics['final_test']
+                results["Final Test Accuracy"] = f"{final_metrics['test_accuracy']:.4f}"
+                results["Final Test F1 Score"] = f"{final_metrics['test_f1']:.4f}"
+
             results["Feature Count"] = metrics.get('n_features', 0)
             results["Training Time"] = f"{metrics.get('training_time', 0):.2f} seconds"
+
             self.cli.show_results("Model Training Complete", results)
 
         except Exception as e:

@@ -193,6 +193,158 @@ class DataStorage:
         latest_model = max(matching_files, key=lambda f: f.stat().st_ctime)
         return str(latest_model)
 
+    def find_latest_split_data(self, symbol: Optional[str] = None, timeframe: Optional[str] = None) -> Dict[
+        str, Dict[str, str]]:
+        """Find the latest data files in each of the train, validation, and test directories."""
+        if symbol is None:
+            symbol = self.config["data"]["symbol"]
+
+        split_paths = {
+            "train": {},
+            "validation": {},
+            "test": {}
+        }
+
+        # Get directory paths from config
+        train_path = Path(self.config["data"].get("train_path", "data_output/processed_data/train"))
+        validation_path = Path(self.config["data"].get("validation_path", "data_output/processed_data/validation"))
+        test_path = Path(self.config["data"].get("test_path", "data_output/processed_data/test"))
+
+        # Convert to absolute paths if they're relative
+        if not train_path.is_absolute():
+            train_path = self.project_root / train_path
+        if not validation_path.is_absolute():
+            validation_path = self.project_root / validation_path
+        if not test_path.is_absolute():
+            test_path = self.project_root / test_path
+
+        # Find latest files in each directory
+        for split_type, dir_path in [("train", train_path), ("validation", validation_path), ("test", test_path)]:
+            if not dir_path.exists():
+                logger.warning(f"Directory not found: {dir_path}")
+                continue
+
+            if timeframe:
+                # Find latest file for specific timeframe
+                pattern = f"{symbol}_{timeframe}_*.csv"
+                matching_files = list(dir_path.glob(pattern))
+                if matching_files:
+                    latest_file = max(matching_files, key=lambda f: f.stat().st_ctime)
+                    split_paths[split_type][timeframe] = str(latest_file)
+            else:
+                # Find latest files for all timeframes
+                for tf in self.config["data"]["timeframes"]:
+                    pattern = f"{symbol}_{tf}_*.csv"
+                    matching_files = list(dir_path.glob(pattern))
+                    if matching_files:
+                        latest_file = max(matching_files, key=lambda f: f.stat().st_ctime)
+                        split_paths[split_type][tf] = str(latest_file)
+
+        return split_paths
+
+    def save_split_dataframes(self, split_data: Dict[str, Dict[str, pd.DataFrame]], name: str,
+                              include_timestamp: bool = True) -> Dict[str, Dict[str, str]]:
+        """Save train, validation, and test dataframes to their respective directories."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") if include_timestamp else ""
+        saved_paths = {"train": {}, "validation": {}, "test": {}}
+
+        # Get directory paths from config
+        train_path = Path(self.config["data"].get("train_path", "data_output/processed_data/train"))
+        validation_path = Path(self.config["data"].get("validation_path", "data_output/processed_data/validation"))
+        test_path = Path(self.config["data"].get("test_path", "data_output/processed_data/test"))
+
+        # Convert to absolute paths if they're relative
+        if not train_path.is_absolute():
+            train_path = self.project_root / train_path
+        if not validation_path.is_absolute():
+            validation_path = self.project_root / validation_path
+        if not test_path.is_absolute():
+            test_path = self.project_root / test_path
+
+        # Create directories if they don't exist
+        train_path.mkdir(parents=True, exist_ok=True)
+        validation_path.mkdir(parents=True, exist_ok=True)
+        test_path.mkdir(parents=True, exist_ok=True)
+
+        # Save each split data
+        for split_type, timeframe_data in split_data.items():
+            for tf, df in timeframe_data.items():
+                if split_type == "train":
+                    filename = f"{name}_{tf}_{timestamp}.csv" if timestamp else f"{name}_{tf}.csv"
+                    filepath = train_path / filename
+                elif split_type == "validation":
+                    filename = f"{name}_{tf}_{timestamp}.csv" if timestamp else f"{name}_{tf}.csv"
+                    filepath = validation_path / filename
+                else:  # test
+                    filename = f"{name}_{tf}_{timestamp}.csv" if timestamp else f"{name}_{tf}.csv"
+                    filepath = test_path / filename
+
+                df.to_csv(filepath)
+                saved_paths[split_type][tf] = str(filepath)
+                logger.info(f"Saved {split_type} {tf} data to {filepath}")
+
+        return saved_paths
+
+    def load_split_data(self, split_paths: Dict[str, Dict[str, str]]) -> Dict[str, Dict[str, pd.DataFrame]]:
+        """Load train, validation, and test data from paths."""
+        split_data = {"train": {}, "validation": {}, "test": {}}
+
+        for split_type, timeframe_paths in split_paths.items():
+            for timeframe, path in timeframe_paths.items():
+                fp = Path(path)
+                if fp.exists():
+                    try:
+                        split_data[split_type][timeframe] = pd.read_csv(fp, index_col=0, parse_dates=True)
+                        logger.info(
+                            f"Loaded {split_type} {timeframe} data from {fp}: {len(split_data[split_type][timeframe])} rows")
+                    except Exception as e:
+                        logger.warning(f"Error loading {split_type} {timeframe} data from {path}: {str(e)}")
+                else:
+                    logger.warning(f"File not found: {path}")
+
+        return split_data
+
+    def find_latest_processed_split_data(self, symbol: Optional[str] = None) -> Dict[str, Dict[str, str]]:
+        """Find the latest processed data files in train, validation, and test directories."""
+        if symbol is None:
+            symbol = self.config["data"]["symbol"]
+
+        # Create paths for each split
+        train_path = Path(self.config["data"].get("train_path", "data_output/processed_data/train"))
+        validation_path = Path(self.config["data"].get("validation_path", "data_output/processed_data/validation"))
+        test_path = Path(self.config["data"].get("test_path", "data_output/processed_data/test"))
+
+        # Convert to absolute paths if they're relative
+        if not train_path.is_absolute():
+            train_path = self.project_root / train_path
+        if not validation_path.is_absolute():
+            validation_path = self.project_root / validation_path
+        if not test_path.is_absolute():
+            test_path = self.project_root / test_path
+
+        processed_files = {"train": {}, "validation": {}, "test": {}}
+        suffix = "processed"
+
+        for split_type, path in [("train", train_path), ("validation", validation_path), ("test", test_path)]:
+            if not path.exists():
+                continue
+
+            for tf in self.config["data"]["timeframes"]:
+                # Look for files with the processed suffix
+                filename = f"{symbol}_{tf}_{suffix}.csv"
+                file_path = path / filename
+                if file_path.exists():
+                    processed_files[split_type][tf] = str(file_path)
+                else:
+                    # If not found, try to find the latest file for this timeframe
+                    pattern = f"{symbol}_{tf}_*.csv"
+                    matching_files = list(path.glob(pattern))
+                    if matching_files:
+                        latest_file = max(matching_files, key=lambda f: f.stat().st_ctime)
+                        processed_files[split_type][tf] = str(latest_file)
+
+        return processed_files
+
 
 def main():
     storage = DataStorage()

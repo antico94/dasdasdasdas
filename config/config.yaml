@@ -1,11 +1,17 @@
 data:
-  lookback_days: 365
+  lookback_days: 1825  # 5 years of data
   save_path: data_output/fetched_data_for_training
+  processed_path: data_output/processed_data
+  train_path: data_output/processed_data/train
+  validation_path: data_output/processed_data/validation
+  test_path: data_output/processed_data/test
   results_path: data_output/trained_models
-  split_ratio: 0.8
+  train_ratio: 0.7
+  validation_ratio: 0.15
+  test_ratio: 0.15
   symbol: XAUUSD
   timeframes:
-  - H1  # Focusing on H1 for gold trading
+    - H1
 features:
   technical_indicators:
   - indicators:

@@ -1,4 +1,5 @@
 import datetime as dt
+from datetime import datetime
 import os
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
@@ -211,58 +212,162 @@ class MT5DataFetcher:
                 self.logger.error(f"Error fetching external data for {source['name']}: {str(e)}")
         return external_data
 
-    def save_data(self, data_dict: Dict[str, pd.DataFrame], symbol: Optional[str] = None) -> None:
+    def fetch_and_split_data(self, symbol: str = None, lookback_days: int = None) -> Dict[str, Dict[str, pd.DataFrame]]:
+        """Fetch data and split it chronologically into train, validation and test sets."""
+        if symbol is None:
+            symbol = self.config["data"]["symbol"]
+        if lookback_days is None:
+            lookback_days = self.config["data"]["lookback_days"]
+
+        # Get data for all timeframes
+        data_dict = self.fetch_all_timeframes(symbol, lookback_days)
+        if not data_dict:
+            self.logger.error("Failed to fetch data")
+            return {}
+
+        # Get split ratios from config
+        train_ratio = self.config["data"].get("train_ratio", 0.7)
+        validation_ratio = self.config["data"].get("validation_ratio", 0.15)
+
+        # Create output structure
+        split_data = {
+            "train": {},
+            "validation": {},
+            "test": {}
+        }
+
+        # Split each timeframe's data
+        for tf, df in data_dict.items():
+            self.logger.info(f"Splitting {tf} data with {len(df)} rows")
+
+            # Calculate split indices
+            train_end = int(len(df) * train_ratio)
+            val_end = int(len(df) * (train_ratio + validation_ratio))
+
+            # Split the data
+            split_data["train"][tf] = df.iloc[:train_end].copy()
+            split_data["validation"][tf] = df.iloc[train_end:val_end].copy()
+            split_data["test"][tf] = df.iloc[val_end:].copy()
+
+            # Log split sizes
+            self.logger.info(f"Train: {len(split_data['train'][tf])} rows")
+            self.logger.info(f"Validation: {len(split_data['validation'][tf])} rows")
+            self.logger.info(f"Test: {len(split_data['test'][tf])} rows")
+
+        return split_data
+
+    def save_split_data(self, split_data: Dict[str, Dict[str, pd.DataFrame]], symbol: Optional[str] = None) -> Dict[
+        str, Dict[str, str]]:
+        """Save train, validation, and test data to separate directories."""
         if symbol is None:
             symbol = self.config["data"]["symbol"]
 
-        save_path = Path(self.config["data"]["save_path"])
-        save_path.mkdir(parents=True, exist_ok=True)
-        timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        for tf, df in data_dict.items():
-            filename = save_path / f"{symbol}_{tf}_{timestamp}.csv"
-            df.to_csv(filename)
-            self.logger.info(f"Saved {len(df)} rows to {filename}")
-        self.logger.info(f"All MT5 data saved to {save_path}")
+        # Get directory paths from config
+        train_path = Path(self.config["data"].get("train_path", "data_output/processed_data/train"))
+        validation_path = Path(self.config["data"].get("validation_path", "data_output/processed_data/validation"))
+        test_path = Path(self.config["data"].get("test_path", "data_output/processed_data/test"))
 
-    def save_external_data(self, external_data: Dict[str, pd.DataFrame]) -> None:
-        save_path = Path(self.config["data"]["save_path"])
-        save_path.mkdir(parents=True, exist_ok=True)
-        timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Create directories if they don't exist
+        train_path.mkdir(parents=True, exist_ok=True)
+        validation_path.mkdir(parents=True, exist_ok=True)
+        test_path.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        saved_paths = {"train": {}, "validation": {}, "test": {}}
+
+        # Save each timeframe's data
+        for split_name, tf_data in split_data.items():
+            for tf, df in tf_data.items():
+                if split_name == "train":
+                    file_path = train_path / f"{symbol}_{tf}_{timestamp}.csv"
+                elif split_name == "validation":
+                    file_path = validation_path / f"{symbol}_{tf}_{timestamp}.csv"
+                else:  # test
+                    file_path = test_path / f"{symbol}_{tf}_{timestamp}.csv"
+
+                df.to_csv(file_path)
+                saved_paths[split_name][tf] = str(file_path)
+                self.logger.info(f"Saved {split_name} {tf} data: {len(df)} rows to {file_path}")
+
+        return saved_paths
+
+    def fetch_split_and_save(self, symbol: str = None, lookback_days: int = None) -> Dict[str, Dict[str, str]]:
+        """Fetch data, split it chronologically and save to appropriate directories."""
+        # Fetch and split the data
+        split_data = self.fetch_and_split_data(symbol, lookback_days)
+        if not split_data:
+            self.logger.error("Failed to fetch and split data")
+            return {}
+
+        # Save the split data
+        paths = self.save_split_data(split_data, symbol)
+
+        self.logger.info("Data fetch, split, and save completed successfully")
+        return paths
+
+    def save_external_data(self, external_data: Dict[str, pd.DataFrame]) -> Dict[str, str]:
+        """Save external data to the appropriate directory and return paths."""
+        # Get directory path from config
+        ext_path = Path(self.config["data"].get("external_data_path", "data_output/external_data"))
+        ext_path.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        saved_paths = {}
+
         for name, df in external_data.items():
-            filename = save_path / f"{name}_{timestamp}.csv"
-            df.to_csv(filename)
-            self.logger.info(f"Saved external data {name}: {len(df)} rows to {filename}")
-        self.logger.info(f"All external data saved to {save_path}")
+            file_path = ext_path / f"{name}_{timestamp}.csv"
+            df.to_csv(file_path)
+            saved_paths[name] = str(file_path)
+            self.logger.info(f"Saved external data {name}: {len(df)} rows to {file_path}")
 
-    def get_latest_data_paths(self) -> Dict[str, str]:
-        save_path = Path(self.config["data"]["save_path"])
+        return saved_paths
+
+    def get_latest_data_paths(self, split_type: Optional[str] = None) -> Dict[str, str]:
+        """Get the latest data paths for a specific split type (train, validation, test) or raw data."""
+        if split_type is None:
+            # For backward compatibility, return paths from the original save_path
+            save_path = Path(self.config["data"]["save_path"])
+        else:
+            # Get path for specified split type
+            split_path_key = f"{split_type}_path"
+            save_path = Path(self.config["data"].get(split_path_key, f"data_output/processed_data/{split_type}"))
+
         if not save_path.exists():
             return {}
+
         latest_files = {}
         timeframes = self.config["data"]["timeframes"]
+
         for tf in timeframes:
             pattern = f"{self.config['data']['symbol']}_{tf}_*.csv"
             matching = list(save_path.glob(pattern))
             if matching:
                 latest = max(matching, key=lambda p: p.stat().st_ctime)
                 latest_files[tf] = str(latest)
+
         return latest_files
 
     def get_latest_external_data_paths(self) -> Dict[str, str]:
-        save_path = Path(self.config["data"]["save_path"])
-        if not save_path.exists():
+        """Get the latest external data paths."""
+        ext_path = Path(self.config["data"].get("external_data_path", "data_output/external_data"))
+
+        if not ext_path.exists():
             return {}
+
         latest_files = {}
+
         for source in self.config.get("features", {}).get("external_data", []):
             name = source["name"]
             pattern = f"{name}_*.csv"
-            matching = list(save_path.glob(pattern))
+            matching = list(ext_path.glob(pattern))
             if matching:
                 latest = max(matching, key=lambda p: p.stat().st_ctime)
                 latest_files[name] = str(latest)
+
         return latest_files
 
     def load_data_from_paths(self, data_paths: Dict[str, str]) -> Dict[str, pd.DataFrame]:
+        """Load data from the provided file paths."""
         data_dict = {}
         for tf, path in data_paths.items():
             p = Path(path)
@@ -279,27 +384,3 @@ class MT5DataFetcher:
     # Alias load_data so external modules expecting this name work correctly.
     def load_data(self, data_paths: Dict[str, str]) -> Dict[str, pd.DataFrame]:
         return self.load_data_from_paths(data_paths)
-
-
-def main():
-    fetcher = MT5DataFetcher()
-    if fetcher.initialize():
-        try:
-            mt5_data = fetcher.fetch_all_timeframes()
-            fetcher.save_data(mt5_data)
-            ext_data = fetcher.fetch_external_data()
-            fetcher.save_external_data(ext_data)
-            latest_mt5 = fetcher.get_latest_data_paths()
-            latest_ext = fetcher.get_latest_external_data_paths()
-            fetcher.logger.info("Latest MT5 data files:")
-            for tf, path in latest_mt5.items():
-                fetcher.logger.info(f"  {tf}: {path}")
-            fetcher.logger.info("Latest external data files:")
-            for name, path in latest_ext.items():
-                fetcher.logger.info(f"  {name}: {path}")
-        finally:
-            fetcher.shutdown()
-
-
-if __name__ == "__main__":
-    main()

@@ -1,5 +1,6 @@
 import os
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Any
+from pathlib import Path
 import yaml
 import numpy as np
 import pandas as pd
@@ -44,6 +45,24 @@ class DataProcessor:
             else:
                 self.logger.warning(f"File not found - {path}")
         return data_dict
+
+    def load_split_data(self, split_paths: Dict[str, Dict[str, str]]) -> Dict[str, Dict[str, pd.DataFrame]]:
+        """Load train, validation and test data from paths."""
+        split_data = {"train": {}, "validation": {}, "test": {}}
+
+        for split_type, timeframe_paths in split_paths.items():
+            for timeframe, path in timeframe_paths.items():
+                if os.path.exists(path):
+                    try:
+                        split_data[split_type][timeframe] = pd.read_csv(path, index_col=0, parse_dates=True)
+                        self.logger.info(
+                            f"Loaded {split_type} {timeframe} data: {len(split_data[split_type][timeframe])} rows")
+                    except Exception as e:
+                        self.logger.warning(f"Error loading {split_type} {timeframe} data from {path}: {str(e)}")
+                else:
+                    self.logger.warning(f"File not found - {path}")
+
+        return split_data
 
     def load_external_data(self, data_paths: Dict[str, str]) -> Dict[str, pd.DataFrame]:
         """Load external data from CSV files."""
@@ -188,6 +207,22 @@ class DataProcessor:
 
         return processed_data
 
+    def process_split_data(
+            self,
+            split_data: Dict[str, Dict[str, pd.DataFrame]],
+            external_data: Optional[Dict[str, pd.DataFrame]] = None,
+            add_target: bool = True
+    ) -> Dict[str, Dict[str, pd.DataFrame]]:
+        """Process train, validation, and test data separately."""
+        processed_split_data = {"train": {}, "validation": {}, "test": {}}
+
+        # Process each split separately to prevent data leakage
+        for split_type, timeframe_data in split_data.items():
+            self.logger.info(f"Processing {split_type} data...")
+            processed_split_data[split_type] = self.process_data(timeframe_data, external_data, add_target)
+
+        return processed_split_data
+
     def normalize_data(
             self,
             data_dict: Dict[str, pd.DataFrame],
@@ -215,7 +250,7 @@ class DataProcessor:
             # Fit scalers on training data if needed
             if fit_scalers or timeframe not in self.scalers:
                 scaler = StandardScaler()
-                train_size = int(len(df) * self.config["data"]["split_ratio"])
+                train_size = int(len(df) * self.config["data"]["train_ratio"])
 
                 # Fill missing values in training data before fitting the scaler
                 train_data = df.iloc[:train_size].copy()
@@ -253,45 +288,32 @@ class DataProcessor:
 
         return normalized_data
 
-    def split_train_test(
+    def normalize_split_data(
             self,
-            data_dict: Dict[str, pd.DataFrame],
-            split_ratio: Optional[float] = None
-    ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
-        """Split data into training and testing sets chronologically."""
-        if split_ratio is None:
-            split_ratio = self.config["data"]["split_ratio"]
+            split_data: Dict[str, Dict[str, pd.DataFrame]],
+            method: str = "standard"
+    ) -> Dict[str, Dict[str, pd.DataFrame]]:
+        """Normalize train, validation, and test data separately, using training data for fitting the scalers."""
+        normalized_split_data = {"train": {}, "validation": {}, "test": {}}
 
-        train_dict = {}
-        test_dict = {}
+        # First, normalize training data and fit scalers
+        normalized_split_data["train"] = self.normalize_data(split_data["train"], method, fit_scalers=True)
 
-        for timeframe, df in data_dict.items():
-            split_idx = int(len(df) * split_ratio)
-            train_dict[timeframe] = df.iloc[:split_idx].copy()
-            test_dict[timeframe] = df.iloc[split_idx:].copy()
+        # Then normalize validation and test data using the same scalers
+        for split_type in ["validation", "test"]:
+            if split_type in split_data and split_data[split_type]:
+                normalized_split_data[split_type] = self.normalize_data(
+                    split_data[split_type], method, fit_scalers=False
+                )
 
-            self.logger.info(f"{timeframe} - Train: {len(train_dict[timeframe])}, Test: {len(test_dict[timeframe])}")
-
-            # Check target variable distribution
-            target_col = f"target_{self.config['model']['prediction_horizon']}"
-            if target_col in df.columns:
-                train_up_pct = train_dict[timeframe][target_col].mean() * 100
-                test_up_pct = test_dict[timeframe][target_col].mean() * 100
-                self.logger.info(f"Class balance - Train: {train_up_pct:.2f}% up, Test: {test_up_pct:.2f}% up")
-
-                # Check for significant distribution shift
-                if abs(train_up_pct - test_up_pct) > 10:
-                    self.logger.warning(
-                        f"Large target distribution shift between train and test sets: {abs(train_up_pct - test_up_pct):.2f}%")
-
-        return train_dict, test_dict
+        return normalized_split_data
 
     def prepare_ml_features(
             self,
             df: pd.DataFrame,
             horizon: Optional[int] = None,
             drop_na: bool = True,
-            remove_constant_cols: bool = True  # Added parameter to control constant column removal
+            remove_constant_cols: bool = True
     ) -> Tuple[pd.DataFrame, pd.Series]:
         """Prepare ML features and target from the raw dataframe."""
         if horizon is None:
@@ -391,10 +413,30 @@ class DataProcessor:
 
         return X, y
 
-    def save_processed_data(self, data_dict: Dict[str, pd.DataFrame], suffix: str = "processed") -> None:
+    def prepare_ml_features_for_splits(
+            self,
+            split_data: Dict[str, Dict[str, pd.DataFrame]],
+            horizon: Optional[int] = None,
+            drop_na: bool = True,
+            remove_constant_cols: bool = True
+    ) -> Dict[str, Dict[str, Tuple[pd.DataFrame, pd.Series]]]:
+        """Prepare ML features for train, validation and test splits."""
+        prepared_data = {"train": {}, "validation": {}, "test": {}}
+
+        for split_name, timeframe_data in split_data.items():
+            for timeframe, df in timeframe_data.items():
+                self.logger.info(f"Preparing ML features for {split_name} {timeframe} data")
+                X, y = self.prepare_ml_features(df, horizon, drop_na, remove_constant_cols)
+                prepared_data[split_name][timeframe] = (X, y)
+
+        return prepared_data
+
+    def save_processed_data(self, data_dict: Dict[str, pd.DataFrame], suffix: str = "processed") -> Dict[str, str]:
         """Save processed data to CSV files."""
         save_path = self.config["data"]["save_path"]
         symbol = self.config["data"]["symbol"]
+
+        saved_paths = {}
 
         for timeframe, df in data_dict.items():
             # Check for constant columns before saving
@@ -411,4 +453,37 @@ class DataProcessor:
             filename = os.path.join(save_path, f"{symbol}_{timeframe}_{suffix}.csv")
             os.makedirs(os.path.dirname(filename), exist_ok=True)
             df.to_csv(filename)
+            saved_paths[timeframe] = filename
             self.logger.info(f"Saved processed data to {filename}")
+
+        return saved_paths
+
+    def save_processed_split_data(self, split_data: Dict[str, Dict[str, pd.DataFrame]], suffix: str = "processed") -> \
+    Dict[str, Dict[str, str]]:
+        """Save processed train, validation and test data to separate directories."""
+        symbol = self.config["data"]["symbol"]
+        saved_paths = {"train": {}, "validation": {}, "test": {}}
+
+        # Get paths from config
+        train_path = self.config["data"].get("train_path", "data_output/processed_data/train")
+        val_path = self.config["data"].get("validation_path", "data_output/processed_data/validation")
+        test_path = self.config["data"].get("test_path", "data_output/processed_data/test")
+
+        for split_name, timeframe_data in split_data.items():
+            # Determine the appropriate path
+            if split_name == "train":
+                path = train_path
+            elif split_name == "validation":
+                path = val_path
+            else:  # test
+                path = test_path
+
+            # Save each timeframe
+            for timeframe, df in timeframe_data.items():
+                filename = os.path.join(path, f"{symbol}_{timeframe}_{suffix}.csv")
+                os.makedirs(os.path.dirname(filename), exist_ok=True)
+                df.to_csv(filename)
+                saved_paths[split_name][timeframe] = filename
+                self.logger.info(f"Saved {split_name} {timeframe} processed data to {filename}")
+
+        return saved_paths

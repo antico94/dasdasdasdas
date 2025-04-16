@@ -153,128 +153,177 @@ def train_model_pipeline(config: Dict, timeframe: str = "H1") -> Tuple[Any, Dict
     logger.info(f"Starting model training pipeline for {timeframe}")
     start_time = time.time()
 
-    # Load processed data
+    # Load processed split data
     storage = DataStorage()
-    processed_files = storage.find_latest_processed_data()
+    split_paths = storage.find_latest_split_data()
 
-    if timeframe not in processed_files:
-        raise ValueError(f"No processed data found for {timeframe}. Run data processing first.")
+    if not split_paths or "train" not in split_paths or timeframe not in split_paths["train"]:
+        raise ValueError(f"No training data found for {timeframe}. Run data processing first.")
 
     processor = DataProcessor()
-    data_dict = processor.load_data({timeframe: processed_files[timeframe]})
-    df = data_dict[timeframe]
+
+    # Load the train dataset
+    train_data = processor.load_data({timeframe: split_paths["train"][timeframe]})
+    train_df = train_data[timeframe]
+
+    # Load validation dataset if available
+    val_df = None
+    if "validation" in split_paths and timeframe in split_paths["validation"]:
+        val_data = processor.load_data({timeframe: split_paths["validation"][timeframe]})
+        val_df = val_data[timeframe]
+        logger.info(f"Loaded validation data: {len(val_df)} rows")
+
+    # Load test dataset for final evaluation
+    test_df = None
+    if "test" in split_paths and timeframe in split_paths["test"]:
+        test_data = processor.load_data({timeframe: split_paths["test"][timeframe]})
+        test_df = test_data[timeframe]
+        logger.info(f"Loaded test data: {len(test_df)} rows")
 
     try:
-        # Load processed data
-        storage = DataStorage()
-        logger.info("DataStorage initialized")
+        # Check for and update prediction horizon - use 1 period
+        if 'model' in config and 'prediction_horizon' in config['model']:
+            prediction_horizon = config['model']['prediction_horizon']
+            if prediction_horizon != 1:
+                logger.info(f"Changing prediction horizon from {prediction_horizon} to 1 for better performance")
+                config['model']['prediction_horizon'] = 1
+        else:
+            if 'model' not in config:
+                config['model'] = {}
+            config['model']['prediction_horizon'] = 1
+            logger.info("Setting prediction horizon to 1 period")
 
-        processed_files = storage.find_latest_processed_data()
-        logger.info(f"Found processed files: {processed_files}")
+        # Prepare features and target with 1-period horizon
+        X_train, y_train = processor.prepare_ml_features(train_df, horizon=1)
+        logger.info(f"Prepared training features shape: {X_train.shape}, target shape: {y_train.shape}")
 
-        if timeframe not in processed_files:
-            raise ValueError(f"No processed data found for {timeframe}. Run data processing first.")
+        # Prepare validation features if available
+        X_val, y_val = None, None
+        if val_df is not None:
+            X_val, y_val = processor.prepare_ml_features(val_df, horizon=1)
+            logger.info(f"Prepared validation features shape: {X_val.shape}, target shape: {y_val.shape}")
 
-        # Rest of your code...
+        # Prepare test features if available
+        X_test, y_test = None, None
+        if test_df is not None:
+            X_test, y_test = processor.prepare_ml_features(test_df, horizon=1)
+            logger.info(f"Prepared test features shape: {X_test.shape}, target shape: {y_test.shape}")
+
+        # Check for class imbalance
+        train_class_balance = y_train.mean()
+        logger.info(f"Train class balance: {train_class_balance:.4f}")
+
+        if y_val is not None:
+            val_class_balance = y_val.mean()
+            logger.info(f"Validation class balance: {val_class_balance:.4f}")
+
+        if y_test is not None:
+            test_class_balance = y_test.mean()
+            logger.info(f"Test class balance: {test_class_balance:.4f}")
+
+        # Ensure model config exists with defaults
+        if 'model' not in config:
+            config['model'] = {}
+            logger.warning("Model configuration not found, using defaults")
+
+        # Feature selection specifically for gold trading
+        feature_selector = FeatureSelector()
+        if config["model"].get("feature_selection", True):
+            try:
+                # Only use training data for feature selection
+                X_train, selected_features = feature_selector.select_features(
+                    X_train, y_train, method="mutual_info", return_features_only=True
+                )
+                logger.info(f"Selected {len(selected_features)} features: {selected_features[:10]}...")
+
+                # Apply same feature selection to validation and test
+                if X_val is not None:
+                    X_val = X_val[selected_features]
+                if X_test is not None:
+                    X_test = X_test[selected_features]
+            except Exception as e:
+                logger.error(f"Feature selection failed: {str(e)}")
+                logger.info("Using all features")
+                selected_features = X_train.columns.tolist()
+        else:
+            selected_features = X_train.columns.tolist()
+
+        # Determine model type to use
+        model_type = config["model"].get("type", "ensemble")
+
+        # Train with validation data if available, otherwise use X_train
+        if X_val is not None and y_val is not None:
+            model, metrics = train_gold_trading_model(
+                X_train, y_train, X_val, y_val, config,
+                model_type=model_type,
+                use_cross_validation=False,  # No need for CV since we have a validation set
+                hyperparameter_tuning=config["model"].get("hyperparameter_tuning", True)
+            )
+        else:
+            # Fall back to train/test split if no validation data
+            train_size = int(len(X_train) * 0.8)
+            X_train_subset, y_train_subset = X_train.iloc[:train_size], y_train.iloc[:train_size]
+            X_val_subset, y_val_subset = X_train.iloc[train_size:], y_train.iloc[train_size:]
+
+            model, metrics = train_gold_trading_model(
+                X_train_subset, y_train_subset, X_val_subset, y_val_subset, config,
+                model_type=model_type,
+                use_cross_validation=config["model"].get("cross_validation", True),
+                hyperparameter_tuning=config["model"].get("hyperparameter_tuning", True)
+            )
+
+        # Final evaluation on test set if available
+        if X_test is not None and y_test is not None:
+            y_pred = model.predict(X_test)
+            test_metrics = {
+                'test_accuracy': accuracy_score(y_test, y_pred),
+                'test_precision': precision_score(y_test, y_pred, zero_division=0),
+                'test_recall': recall_score(y_test, y_pred, zero_division=0),
+                'test_f1': f1_score(y_test, y_pred, zero_division=0),
+                'classification_report': classification_report(y_test, y_pred, output_dict=True)
+            }
+            metrics['final_test'] = test_metrics
+            logger.info(
+                f"Final test metrics: {test_metrics['test_accuracy']:.4f} accuracy, {test_metrics['test_f1']:.4f} F1")
+
+        # Save model and metadata
+        prediction_target = config["model"].get("prediction_target", "direction")
+        prediction_horizon = config["model"].get("prediction_horizon", 1)
+        model_name = f"{model_type}_{timeframe}_{prediction_target}_{prediction_horizon}"
+
+        metadata = {
+            "features": selected_features,
+            "metrics": metrics,
+            "config": config,
+            "trained_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "data_shape": X_train.shape,
+            "timeframe": timeframe,
+            "prediction_target": prediction_target,
+            "prediction_horizon": prediction_horizon
+        }
+
+        model_path = storage.save_model(model, model_name, metadata=metadata)
+        logger.info(f"Model saved to {model_path}")
+
+        # Calculate training time
+        training_time = time.time() - start_time
+        metrics["training_time"] = training_time
+        metrics["n_features"] = len(selected_features)
+
+        logger.info(f"Model training completed in {training_time:.2f} seconds")
+        if "test" in metrics:
+            logger.info(f"Validation metrics: {metrics['test']}")
+        if "final_test" in metrics:
+            logger.info(f"Final test metrics: {metrics['final_test']}")
+
+        return model, metrics
+
     except Exception as e:
         logger.error(f"Error in train_model_pipeline: {str(e)}")
         logger.error(f"Error details: {type(e).__name__}")
         import traceback
         logger.error(traceback.format_exc())
-        raise  # Re-raise the exception after loggin
-
-    # Check for and update prediction horizon - use 1 period
-    if 'model' in config and 'prediction_horizon' in config['model']:
-        prediction_horizon = config['model']['prediction_horizon']
-        if prediction_horizon != 1:
-            logger.info(f"Changing prediction horizon from {prediction_horizon} to 1 for better performance")
-            config['model']['prediction_horizon'] = 1
-    else:
-        if 'model' not in config:
-            config['model'] = {}
-        config['model']['prediction_horizon'] = 1
-        logger.info("Setting prediction horizon to 1 period")
-
-    # Prepare features and target with 1-period horizon
-    X, y = processor.prepare_ml_features(df, horizon=1)
-    logger.info(f"Prepared features shape: {X.shape}, target shape: {y.shape}")
-
-    # Initialize config with default values if keys don't exist
-    if 'data' not in config:
-        config['data'] = {}
-    if 'split_ratio' not in config.get('data', {}):
-        config['data']['split_ratio'] = 0.8  # Default 80/20 split
-        logger.info("Using default train/test split ratio of 0.8")
-
-    # Split data chronologically
-    train_size = int(len(X) * config["data"]["split_ratio"])
-    X_train, y_train = X.iloc[:train_size], y.iloc[:train_size]
-    X_test, y_test = X.iloc[train_size:], y.iloc[train_size:]
-
-    # Check for class imbalance
-    train_class_balance = y_train.mean()
-    test_class_balance = y_test.mean()
-    logger.info(f"Class balance - Train: {train_class_balance:.4f}, Test: {test_class_balance:.4f}")
-
-    # Ensure model config exists with defaults
-    if 'model' not in config:
-        config['model'] = {}
-        logger.warning("Model configuration not found, using defaults")
-
-    # Feature selection specifically for gold trading
-    feature_selector = FeatureSelector()
-    if config["model"].get("feature_selection", True):
-        try:
-            X_train, X_test, selected_features = feature_selector.select_features(
-                X_train, y_train, X_test, method="mutual_info"
-            )
-            logger.info(f"Selected {len(selected_features)} features: {selected_features[:10]}...")
-        except Exception as e:
-            logger.error(f"Feature selection failed: {str(e)}")
-            logger.info("Using all features")
-            selected_features = X_train.columns.tolist()
-    else:
-        selected_features = X_train.columns.tolist()
-
-    # Determine model type to use
-    model_type = config["model"].get("type", "ensemble")
-
-    # Pass the full config to the training function so it can check for optimized params.
-    model, metrics = train_gold_trading_model(
-        X_train, y_train, X_test, y_test, config,
-        model_type=model_type,
-        use_cross_validation=config["model"].get("cross_validation", True),
-        hyperparameter_tuning=config["model"].get("hyperparameter_tuning", True)
-    )
-
-    # Save model and metadata
-    prediction_target = config["model"].get("prediction_target", "direction")
-    prediction_horizon = config["model"].get("prediction_horizon", 1)  # Use 1 as default now
-    model_name = f"{model_type}_{timeframe}_{prediction_target}_{prediction_horizon}"
-
-    metadata = {
-        "features": selected_features,
-        "metrics": metrics,
-        "config": config,
-        "trained_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "data_shape": X.shape,
-        "timeframe": timeframe,
-        "prediction_target": prediction_target,
-        "prediction_horizon": prediction_horizon
-    }
-
-    model_path = storage.save_model(model, model_name, metadata=metadata)
-    logger.info(f"Model saved to {model_path}")
-
-    # Calculate training time
-    training_time = time.time() - start_time
-    metrics["training_time"] = training_time
-    metrics["n_features"] = len(selected_features)
-
-    logger.info(f"Model training completed in {training_time:.2f} seconds")
-    logger.info(f"Test metrics: {metrics['test']}")
-
-    return model, metrics
+        raise
 
 
 def train_gold_trading_model(
@@ -814,5 +863,51 @@ def train_gold_trading_model(
 
     if train_metrics['train_f1'] - test_metrics['test_f1'] > 0.2:
         logger.warning("Possible overfitting detected: large gap between train and test F1 scores")
+
+    return model, metrics
+
+
+def train_model_with_validation(config: Dict, timeframe: str = "H1") -> Tuple[Any, Dict]:
+    """Train a model using separate training and validation datasets."""
+    logger.info(f"Starting model training for {timeframe} with dedicated validation set")
+
+    # Load training data
+    storage = DataStorage()
+    train_files = storage.find_latest_split_data("train")
+
+    if timeframe not in train_files:
+        raise ValueError(f"No training data found for {timeframe}")
+
+    # Load validation data
+    val_files = storage.find_latest_split_data("validation")
+    if timeframe not in val_files:
+        logger.warning(f"No validation data found for {timeframe}, will use train/test split")
+
+    processor = DataProcessor()
+    train_data = processor.load_data({timeframe: train_files[timeframe]})
+    train_df = train_data[timeframe]
+
+    # Prepare features and target for training
+    X_train, y_train = processor.prepare_ml_features(train_df)
+
+    # Prepare validation data if available
+    if timeframe in val_files:
+        val_data = processor.load_data({timeframe: val_files[timeframe]})
+        val_df = val_data[timeframe]
+        X_val, y_val = processor.prepare_ml_features(val_df)
+    else:
+        # Fall back to train/test split if no validation data
+        train_size = int(len(X_train) * 0.8)
+        X_val, y_val = X_train.iloc[train_size:], y_train.iloc[train_size:]
+        X_train, y_train = X_train.iloc[:train_size], y_train.iloc[:train_size]
+
+    # Train the model with separate validation data
+    model_type = config["model"].get("type", "ensemble")
+    model, metrics = train_gold_trading_model(
+        X_train, y_train, X_val, y_val, config,
+        model_type=model_type,
+        use_cross_validation=False,  # No need for CV with dedicated validation set
+        hyperparameter_tuning=config["model"].get("hyperparameter_tuning", True)
+    )
 
     return model, metrics
