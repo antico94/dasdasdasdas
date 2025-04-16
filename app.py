@@ -242,9 +242,13 @@ class TradingBotApp:
             self.config['model']['cross_validation'] = options['cross_validation']
             self.config['model']['use_bayes_optimizer'] = True
 
-            # Train the model using the updated training pipeline
+            # Get the number of training runs from options (default to 5 if not provided)
+            num_runs = options.get('num_runs', 5)
+
+            # Train the model using the train_best_model function with num_runs parameter
             self.cli.show_progress("Training model", 100)
-            model, metrics = train_model_pipeline(self.config, options['timeframe'])
+            from models.trainer import train_best_model
+            model, metrics = train_best_model(self.config, options['timeframe'], num_runs=num_runs)
 
             # Display results
             results = {
@@ -269,6 +273,8 @@ class TradingBotApp:
 
             results["Feature Count"] = metrics.get('n_features', 0)
             results["Training Time"] = f"{metrics.get('training_time', 0):.2f} seconds"
+            results["Training Runs"] = num_runs
+            results["Best Run Selected"] = metrics.get('best_run', 1)
 
             self.cli.show_results("Model Training Complete", results)
 

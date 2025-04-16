@@ -756,6 +756,9 @@ def train_best_model(config: Dict, timeframe: str = "H1", num_runs: int = 5, ran
     best_accuracy = 0.0
     best_run = 0
 
+    # Track all model files created during the runs
+    all_model_files = []
+
     # Load datasets
     datasets = load_split_datasets(timeframe)
 
@@ -764,7 +767,6 @@ def train_best_model(config: Dict, timeframe: str = "H1", num_runs: int = 5, ran
 
     X_train, y_train, _ = datasets['train']
 
-    # Use validation data if available, otherwise create from training data
     # Use validation data if available, otherwise create from training data
     if 'validation' in datasets:
         X_val, y_val, _ = datasets['validation']
@@ -795,6 +797,9 @@ def train_best_model(config: Dict, timeframe: str = "H1", num_runs: int = 5, ran
     else:
         selected_features = X_train.columns.tolist()
 
+    # Set up storage for saving models
+    storage = DataStorage()
+
     # Run training multiple times with different random seeds
     for run in range(num_runs):
         logger.info(f"Starting training run {run + 1}/{num_runs}")
@@ -819,6 +824,33 @@ def train_best_model(config: Dict, timeframe: str = "H1", num_runs: int = 5, ran
                 accuracy = metrics['test']['test_accuracy']
                 logger.info(f"Run {run + 1} results - F1: {f1:.4f}, Accuracy: {accuracy:.4f}")
 
+                # Save each model with run number in filename
+                prediction_target = config.get("model", {}).get("prediction_target", "direction")
+                prediction_horizon = config.get("model", {}).get("prediction_horizon", 1)
+                model_name = f"{model_type}_{timeframe}_{prediction_target}_{prediction_horizon}_run{run + 1}"
+
+                # Save the model for this run
+                run_metadata = {
+                    "features": selected_features,
+                    "metrics": metrics,
+                    "config": config,
+                    "trained_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "data_shape": X_train.shape,
+                    "timeframe": timeframe,
+                    "prediction_target": prediction_target,
+                    "prediction_horizon": prediction_horizon,
+                    "run": run + 1,
+                    "total_runs": num_runs
+                }
+
+                model_path = storage.save_model(model, model_name, metadata=run_metadata)
+                all_model_files.append(model_path)
+
+                # Also track metadata files
+                metadata_path = model_path.replace(".joblib", "_metadata.pkl")
+                if os.path.exists(metadata_path):
+                    all_model_files.append(metadata_path)
+
                 # Update best model if this one is better
                 if f1 > best_f1:
                     best_model = model
@@ -841,7 +873,7 @@ def train_best_model(config: Dict, timeframe: str = "H1", num_runs: int = 5, ran
     logger.info(f"Best model selected from run {best_run}/{num_runs}")
     logger.info(f"Best model metrics - F1: {best_f1:.4f}, Accuracy: {best_accuracy:.4f}")
 
-    # Save the best model
+    # Save the best model with a special name
     prediction_target = config.get("model", {}).get("prediction_target", "direction")
     prediction_horizon = config.get("model", {}).get("prediction_horizon", 1)
     model_type = config.get("model", {}).get("type", "ensemble")
@@ -860,24 +892,40 @@ def train_best_model(config: Dict, timeframe: str = "H1", num_runs: int = 5, ran
         "total_runs": num_runs
     }
 
-    storage = DataStorage()
-    model_path = storage.save_model(best_model, model_name, metadata=metadata)
-    logger.info(f"Best model saved to {model_path}")
+    best_model_path = storage.save_model(best_model, model_name, metadata=metadata)
+    logger.info(f"Best model saved to {best_model_path}")
+
+    # Add best model metadata to the list to avoid deleting it
+    best_metadata_path = best_model_path.replace(".joblib", "_metadata.pkl")
+    if os.path.exists(best_metadata_path) and best_metadata_path not in all_model_files:
+        all_model_files.append(best_metadata_path)
+
+    # Clean up - delete all models except the best one
+    delete_count = 0
+    for file_path in all_model_files:
+        # Skip the best model file
+        if file_path == best_model_path or file_path == best_metadata_path:
+            continue
+
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                delete_count += 1
+                logger.debug(f"Deleted non-best model file: {file_path}")
+        except Exception as e:
+            logger.warning(f"Failed to delete file {file_path}: {str(e)}")
+
+    logger.info(f"Cleanup complete: deleted {delete_count} non-best model files")
+
+    # Add run information to metrics
+    best_metrics["best_run"] = best_run
+    best_metrics["total_runs"] = num_runs
+    best_metrics["n_features"] = len(selected_features)
 
     return best_model, best_metrics
 
 
 def train_model_pipeline(config: Dict, timeframe: str = "H1") -> Tuple[Any, Dict]:
-    """
-    Complete pipeline for training an optimized model for gold trading.
-
-    Args:
-        config: Configuration dictionary
-        timeframe: Timeframe to use (e.g., "H1")
-
-    Returns:
-        Trained model and its metrics
-    """
     logger.info(f"Starting model training pipeline for {timeframe}")
     start_time = time.time()
 

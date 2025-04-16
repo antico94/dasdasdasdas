@@ -231,7 +231,8 @@ class TradingBotCLI:
             'timeframe': 'H1',
             'hyperparameter_tuning': True,
             'feature_selection': True,
-            'cross_validation': True
+            'cross_validation': True,
+            'num_runs': 5  # Added default value for number of training runs
         }
 
         print("\nCurrent Configuration:")
@@ -240,6 +241,7 @@ class TradingBotCLI:
         print(f"- Hyperparameter tuning: {'Yes' if default_config['hyperparameter_tuning'] else 'No'}")
         print(f"- Feature selection: {'Yes' if default_config['feature_selection'] else 'No'}")
         print(f"- Time-series cross-validation: {'Yes' if default_config['cross_validation'] else 'No'}")
+        print(f"- Number of training runs: {default_config['num_runs']}")  # Added display for number of runs
 
         use_defaults = questionary.select(
             'How would you like to proceed?',
@@ -291,6 +293,13 @@ class TradingBotCLI:
             'Use time-series cross-validation?',
             default=default_config['cross_validation']
         ).ask()
+
+        # Added option for specifying number of training runs
+        results['num_runs'] = int(questionary.text(
+            'Number of training runs to perform (best model will be selected):',
+            default=str(default_config['num_runs']),
+            validate=lambda val: val.isdigit() and 0 < int(val) <= 100
+        ).ask())
 
         return results
 
@@ -465,6 +474,85 @@ class TradingBotCLI:
 
     import os
     from questionary import Choice
+
+    def train_model_menu(self) -> Dict:
+        """Menu for model training options."""
+        default_config = {
+            'model_type': 'ensemble',
+            'timeframe': 'H1',
+            'hyperparameter_tuning': True,
+            'feature_selection': True,
+            'cross_validation': True,
+            'num_runs': 5  # Added default value for number of training runs
+        }
+
+        print("\nCurrent Configuration:")
+        print(f"- Model type: {default_config['model_type']}")
+        print(f"- Timeframe: {default_config['timeframe']}")
+        print(f"- Hyperparameter tuning: {'Yes' if default_config['hyperparameter_tuning'] else 'No'}")
+        print(f"- Feature selection: {'Yes' if default_config['feature_selection'] else 'No'}")
+        print(f"- Time-series cross-validation: {'Yes' if default_config['cross_validation'] else 'No'}")
+        print(f"- Number of training runs: {default_config['num_runs']}")  # Added display for number of runs
+
+        use_defaults = questionary.select(
+            'How would you like to proceed?',
+            choices=[
+                Choice('Train model with current configuration', 'use_defaults'),
+                Choice('Change configuration settings', 'change_config')
+            ]
+        ).ask()
+
+        if use_defaults == 'use_defaults':
+            return default_config
+
+        # Custom configuration
+        results = {}
+
+        results['model_type'] = questionary.select(
+            'Select model type:',
+            choices=[
+                Choice('Random Forest', 'rf'),
+                Choice('XGBoost', 'xgboost'),
+                Choice('LSTM Neural Network', 'lstm'),
+                Choice('Ensemble (Multiple Models)', 'ensemble'),
+            ],
+            default=default_config['model_type']
+        ).ask()
+
+        results['timeframe'] = questionary.select(
+            'Select timeframe for training:',
+            choices=[
+                Choice('M5 (5 minutes)', 'M5'),
+                Choice('M15 (15 minutes)', 'M15'),
+                Choice('H1 (1 hour)', 'H1'),
+                Choice('D1 (Daily)', 'D1'),
+            ],
+            default=default_config['timeframe']
+        ).ask()
+
+        results['hyperparameter_tuning'] = questionary.confirm(
+            'Perform hyperparameter tuning?',
+            default=default_config['hyperparameter_tuning']
+        ).ask()
+
+        results['feature_selection'] = questionary.confirm(
+            'Perform feature selection?',
+            default=default_config['feature_selection']
+        ).ask()
+
+        results['cross_validation'] = questionary.confirm(
+            'Use time-series cross-validation?',
+            default=default_config['cross_validation']
+        ).ask()
+
+        # Added option for specifying number of training runs
+        results['num_runs'] = int(questionary.text(
+            'Number of training runs to perform (best model will be selected):',
+            default=str(default_config['num_runs']),
+            validate=lambda val: val.isdigit() and 0 < int(val) <= 100
+        ).ask())
+
+        return results
 
     def _get_available_models(self) -> List[Choice]:
         """Get list of available trained models."""
