@@ -49,24 +49,23 @@ def backtest_model_with_strategy(
         except Exception as e:
             logger.error(f"Error loading metadata: {str(e)}")
 
-    # Load and prepare test data
+    # Load test data from the test split
     storage = DataStorage()
-    latest_processed_data = storage.find_latest_processed_data()
-    if timeframe not in latest_processed_data:
-        logger.error(f"No processed data found for timeframe {timeframe}")
+    split_paths = storage.find_latest_split_data()
+
+    if "test" not in split_paths or timeframe not in split_paths["test"]:
+        logger.error(f"No test data found for timeframe {timeframe}")
         return {}, pd.DataFrame(), []
 
-    logger.info(f"Loading test data from {latest_processed_data[timeframe]}")
+    logger.info(f"Loading test data from {split_paths['test'][timeframe]}")
     try:
-        df = pd.read_csv(latest_processed_data[timeframe], index_col=0, parse_dates=True)
-        logger.info(f"Loaded data shape: {df.shape}")
+        processor = DataProcessor()
+        test_data_dict = processor.load_data({timeframe: split_paths["test"][timeframe]})
+        test_data = test_data_dict[timeframe]
+        logger.info(f"Loaded test data shape: {test_data.shape}")
     except Exception as e:
         logger.error(f"Error loading test data: {str(e)}")
         return {}, pd.DataFrame(), []
-
-    # Use the last 20% of data for testing (or load specific test split if available)
-    test_data = df.iloc[int(len(df) * 0.8):].copy()
-    logger.info(f"Test data shape: {test_data.shape}")
 
     # Get horizon from model path or metadata
     horizon = 1  # Default value
@@ -86,7 +85,6 @@ def backtest_model_with_strategy(
         logger.info(f"Using default horizon: {horizon}")
 
     # Prepare features and target using the DataProcessor
-    processor = DataProcessor()
     X_test, y_test = processor.prepare_ml_features(test_data, horizon=horizon)
     logger.info(f"Prepared features shape: {X_test.shape}, target shape: {y_test.shape}")
 
@@ -654,14 +652,33 @@ class Backtest:
         horizon = self._get_prediction_horizon(model_path, model_metadata)
         self.logger.info(f"Using prediction horizon: {horizon}")
 
-        # Load test data
-        test_data = self._load_test_data(timeframe)
-        if test_data is None:
+        # Load test data from the test split
+        storage = DataStorage()
+        split_paths = storage.find_latest_split_data()
+
+        if "test" not in split_paths or timeframe not in split_paths["test"]:
+            self.logger.error(f"No test data found for timeframe {timeframe}")
             return None, None, None
 
+        processor = DataProcessor()
+        test_data_dict = processor.load_data({timeframe: split_paths["test"][timeframe]})
+        test_data = test_data_dict[timeframe]
+        self.logger.info(f"Loaded test data: {len(test_data)} rows from {split_paths['test'][timeframe]}")
+
         # Prepare features and get model predictions
-        X_test, model_predictions = self._prepare_features_and_predict(model, test_data, model_metadata, horizon)
+        X_test, y_test = processor.prepare_ml_features(test_data, horizon=horizon)
         if X_test is None:
+            self.logger.error("Failed to prepare features from test data")
+            return None, None, None
+
+        # Filter features to match the model
+        X_test = self._filter_features(X_test, model, model_metadata)
+        if X_test is None:
+            return None, None, None
+
+        # Generate predictions
+        model_predictions = self._generate_predictions(model, X_test)
+        if model_predictions is None:
             return None, None, None
 
         # Return only the test data rows that match our feature timeframe
@@ -1494,54 +1511,34 @@ class Backtest:
 
         return best_params, best_result
 
-    def run_backtest(config_path: str, model_path: str, strategy_name: str, timeframe: str) -> None:
-        """
-        Run a backtest from command line.
+    def _generate_predictions(self, model, X_test: pd.DataFrame) -> pd.DataFrame:
+        """Generate predictions using the model on the test data."""
+        model_predictions = pd.DataFrame(index=X_test.index)
 
-        Args:
-            config_path: Path to config file
-            model_path: Path to model file
-            strategy_name: Name of strategy to use
-            timeframe: Timeframe to use
-        """
-        # Load config
-        import json
-        with open(config_path, 'r') as f:
-            config = json.load(f)
+        try:
+            is_classifier = hasattr(model, 'predict_proba')
 
-        # Create backtest engine
-        backtest = Backtest(config)
+            if is_classifier:
+                y_pred_proba = model.predict_proba(X_test)
 
-        # Run backtest
-        result = backtest.run(model_path, strategy_name, timeframe)
+                if y_pred_proba.shape[1] == 2:
+                    model_predictions['pred_probability_up'] = y_pred_proba[:, 1]
+                    model_predictions['pred_probability_down'] = 1 - y_pred_proba[:, 1]
 
-        # Create and save plots
-        fig1 = backtest.plot_equity_curve(result)
-        fig2 = backtest.plot_trade_distribution(result)
+                    # Log distribution statistics
+                    self._log_prediction_distribution(model_predictions['pred_probability_up'])
+                else:
+                    self.logger.warning(f"Unexpected prediction shape: {y_pred_proba.shape}")
+            else:
+                y_pred = model.predict(X_test)
+                model_predictions['predicted_value'] = y_pred
+                self.logger.info(
+                    f"Prediction statistics: min={y_pred.min():.4f}, "
+                    f"max={y_pred.max():.4f}, mean={y_pred.mean():.4f}"
+                )
 
-        # Save plots
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_name = os.path.basename(model_path).replace('.joblib', '')
+            return model_predictions
 
-        fig1.savefig(f"{model_name}_{strategy_name}_{timeframe}_equity_{timestamp}.png")
-        fig2.savefig(f"{model_name}_{strategy_name}_{timeframe}_trades_{timestamp}.png")
-
-        # Print summary
-        print("\n" + "=" * 50)
-        print("Backtest Summary")
-        print("=" * 50)
-        print(f"Model: {model_path}")
-        print(f"Strategy: {strategy_name}")
-        print(f"Timeframe: {timeframe}")
-        print(f"Initial Balance: ${result.metrics['initial_balance']:.2f}")
-        print(f"Final Balance: ${result.metrics['final_balance']:.2f}")
-        print(f"Total Return: {result.metrics['return_pct']:.2f}%")
-        print(f"Number of Trades: {result.metrics['n_trades']}")
-
-        if result.metrics.get('win_rate') is not None:
-            print(f"Win Rate: {result.metrics['win_rate']:.2f}")
-            print(f"Profit Factor: {result.metrics.get('profit_factor', 0):.2f}")
-            print(f"Max Drawdown: {result.metrics.get('max_drawdown_pct', 0):.2f}%")
-            print(f"Sharpe Ratio: {result.metrics.get('sharpe_ratio', 0):.2f}")
-
-        print("=" * 50)
+        except Exception as e:
+            self.logger.error(f"Error generating predictions: {str(e)}")
+            return None

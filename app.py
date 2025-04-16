@@ -307,6 +307,17 @@ class TradingBotApp:
             self.config['strategy']['use_trailing_stop'] = True
             self.config['strategy']['min_confidence'] = 0.7
 
+            # Verify test data exists
+            storage = DataStorage()
+            split_paths = storage.find_latest_split_data()
+
+            if "test" not in split_paths or options['timeframe'] not in split_paths["test"]:
+                self.cli.show_results("Error", {
+                    "Status": "No test data found. Please fetch and process data first.",
+                    "Details": f"Missing test data for timeframe {options['timeframe']}"
+                })
+                return
+
             # Create strategy instance
             from strategy.strategies import StrategyFactory
             strategy = StrategyFactory.create_strategy('goldtrend', self.config)
@@ -363,7 +374,7 @@ class TradingBotApp:
             if self.cli.confirm_action("view detailed backtest visualizations"):
                 from models.visualization import visualize_backtest_results
                 storage = DataStorage()
-                models_dir = os.path.join(storage.base_path, "../data_output/trained_models")
+                models_dir = os.path.join(storage.project_root, "data_output", "trained_models")
                 backtest_files = [f for f in os.listdir(models_dir)
                                   if "_backtest_" in f and f.endswith('.pkl')]
                 if backtest_files:
