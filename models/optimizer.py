@@ -4,6 +4,8 @@ from typing import Dict, Tuple, Any, Optional
 from collections import OrderedDict
 
 import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import f1_score
 
 # Backwards-compatibility patch for deprecated np.int
 if not hasattr(np, 'int'):
@@ -80,7 +82,8 @@ class HyperparameterOptimizer:
 
         return best_params
 
-    def optimize_random_forest(self, X_train: pd.DataFrame, y_train: pd.Series) -> Tuple[
+    def optimize_random_forest(self, X_train: pd.DataFrame, y_train: pd.Series,
+                               X_val: pd.DataFrame = None, y_val: pd.Series = None) -> Tuple[
         Dict[str, Any], Dict[str, Any]]:
         logger.info("Optimizing Random Forest hyperparameters...")
         search_space = {
@@ -96,35 +99,109 @@ class HyperparameterOptimizer:
         logger.info(f"RF search space: {search_space}")
 
         try:
-            optimizer = BayesSearchCV(
-                model,
-                search_space,
-                n_iter=self.n_iter,
-                cv=TimeSeriesSplit(n_splits=self.n_splits),
-                scoring=self.scoring,
-                n_jobs=self.n_jobs,
-                verbose=1
-            )
-            optimizer.fit(X_train, y_train)
-            best_params = optimizer.best_params_
-            best_score = optimizer.best_score_
+            # If validation data is provided, use it directly instead of CV
+            if X_val is not None and y_val is not None:
+                logger.info("Using provided validation data instead of cross-validation")
 
-            # Validate results
-            if not best_params:
-                raise ValueError("BayesSearchCV returned empty best_params")
+                # Initialize best parameters
+                best_params = None
+                best_score = -float('inf')
+                cv_results = {"param_" + k: [] for k in search_space.keys()}
+                cv_results["mean_test_score"] = []
 
-            # Convert OrderedDict to dict
-            best_params = convert_ordered_dicts(best_params)
+                # Generate parameter combinations
+                from skopt.utils import create_result
+                from skopt.space import Dimension
 
-            results = {
-                'best_params': best_params,
-                'best_score': best_score,
-                'all_results': optimizer.cv_results_
-            }
-            logger.info(f"RF Best parameters: {best_params}")
-            logger.info(f"RF Best score: {best_score}")
+                # Convert skopt space to list of Dimension objects
+                dimensions = []
+                for key, value in search_space.items():
+                    if isinstance(value, Dimension):
+                        dimensions.append(value)
+                    else:
+                        raise ValueError(f"Invalid search space item: {key}: {value}")
 
-            return best_params, results
+                # Use random search for simplicity
+                from skopt.utils import dimensions_aslist
+                from numpy.random import RandomState
+
+                random_state = RandomState(self.config.get('model', {}).get('random_seed', 42))
+                n_iterations = self.n_iter
+
+                logger.info(f"Performing random search with {n_iterations} iterations")
+
+                for i in range(n_iterations):
+                    # Sample random parameters
+                    params = {key: dim.rvs(random_state=random_state)[0]
+                              for key, dim in zip(search_space.keys(), dimensions)}
+
+                    # Create and train model with these parameters
+                    rf_model = RandomForestClassifier(
+                        **params,
+                        class_weight='balanced',
+                        random_state=self.config.get('model', {}).get('random_seed', 42),
+                        n_jobs=self.n_jobs
+                    )
+
+                    rf_model.fit(X_train, y_train)
+
+                    # Predict on validation set
+                    y_pred = rf_model.predict(X_val)
+                    score = f1_score(y_val, y_pred)
+
+                    # Track parameters and score
+                    for key in search_space.keys():
+                        cv_results["param_" + key].append(params[key])
+                    cv_results["mean_test_score"].append(score)
+
+                    # Update best if needed
+                    if score > best_score:
+                        best_score = score
+                        best_params = params.copy()
+                        logger.info(
+                            f"New best RF params (iter {i + 1}/{n_iterations}): {best_params}, F1: {best_score:.4f}")
+
+                results = {
+                    'best_params': best_params,
+                    'best_score': best_score,
+                    'all_results': cv_results
+                }
+                logger.info(f"RF Best parameters: {best_params}")
+                logger.info(f"RF Best score: {best_score}")
+
+                return best_params, results
+            else:
+                # Use BayesSearchCV with cross-validation if no validation data
+                logger.info("No validation data provided, using BayesSearchCV with TimeSeriesSplit")
+                optimizer = BayesSearchCV(
+                    model,
+                    search_space,
+                    n_iter=self.n_iter,
+                    cv=TimeSeriesSplit(n_splits=self.n_splits),
+                    scoring=self.scoring,
+                    n_jobs=self.n_jobs,
+                    verbose=1
+                )
+                optimizer.fit(X_train, y_train)
+                best_params = optimizer.best_params_
+                best_score = optimizer.best_score_
+
+                # Validate results
+                if not best_params:
+                    raise ValueError("BayesSearchCV returned empty best_params")
+
+                # Convert OrderedDict to dict
+                best_params = convert_ordered_dicts(best_params)
+
+                results = {
+                    'best_params': best_params,
+                    'best_score': best_score,
+                    'all_results': optimizer.cv_results_
+                }
+                logger.info(f"RF Best parameters: {best_params}")
+                logger.info(f"RF Best score: {best_score}")
+
+                return best_params, results
 
         except Exception as e:
             logger.error(f"Error in Random Forest optimization: {str(e)}")
@@ -147,7 +224,8 @@ class HyperparameterOptimizer:
 
             return best_params, results
 
-    def optimize_xgboost(self, X_train: pd.DataFrame, y_train: pd.Series) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    def optimize_xgboost(self, X_train: pd.DataFrame, y_train: pd.Series,
+                         X_val: pd.DataFrame = None, y_val: pd.Series = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         logger.info("Optimizing XGBoost hyperparameters...")
         search_space = {
             'n_estimators': Integer(50, 500),
@@ -164,35 +242,118 @@ class HyperparameterOptimizer:
 
         try:
             model = XGBoostModel(self.config).model
-            optimizer = BayesSearchCV(
-                model,
-                search_space,
-                n_iter=self.n_iter,
-                cv=TimeSeriesSplit(n_splits=self.n_splits),
-                scoring=self.scoring,
-                n_jobs=self.n_jobs,
-                verbose=1
-            )
-            optimizer.fit(X_train, y_train)
-            best_params = optimizer.best_params_
-            best_score = optimizer.best_score_
 
-            # Validate results
-            if not best_params:
-                raise ValueError("BayesSearchCV returned empty best_params")
+            # If validation data is provided, use it directly instead of CV
+            if X_val is not None and y_val is not None:
+                logger.info("Using provided validation data instead of cross-validation")
 
-            # Convert OrderedDict to dict
-            best_params = convert_ordered_dicts(best_params)
+                # Initialize best parameters
+                best_params = None
+                best_score = -float('inf')
+                cv_results = {"param_" + k: [] for k in search_space.keys()}
+                cv_results["mean_test_score"] = []
 
-            results = {
-                'best_params': best_params,
-                'best_score': best_score,
-                'all_results': optimizer.cv_results_
-            }
-            logger.info(f"XGB Best parameters: {best_params}")
-            logger.info(f"XGB Best score: {best_score}")
+                # Generate parameter combinations
+                from skopt.utils import create_result
+                from skopt.space import Dimension
 
-            return best_params, results
+                # Convert skopt space to list of Dimension objects
+                dimensions = []
+                for key, value in search_space.items():
+                    if isinstance(value, Dimension):
+                        dimensions.append(value)
+                    else:
+                        raise ValueError(f"Invalid search space item: {key}: {value}")
+
+                # Use random search for simplicity
+                from skopt.utils import dimensions_aslist
+                from numpy.random import RandomState
+
+                random_state = RandomState(self.config.get('model', {}).get('random_seed', 42))
+                n_iterations = self.n_iter
+
+                logger.info(f"Performing random search with {n_iterations} iterations")
+
+                # Calculate class weights if needed for XGBoost
+                scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum() if (y_train == 1).sum() > 0 else 1.0
+
+                for i in range(n_iterations):
+                    # Sample random parameters
+                    params = {key: dim.rvs(random_state=random_state)[0]
+                              for key, dim in zip(search_space.keys(), dimensions)}
+
+                    # Create and train model with these parameters
+                    xgb_model = xgb.XGBClassifier(
+                        **params,
+                        scale_pos_weight=scale_pos_weight,
+                        random_state=self.config.get('model', {}).get('random_seed', 42),
+                        use_label_encoder=False,
+                        eval_metric='logloss',
+                        n_jobs=self.n_jobs
+                    )
+
+                    # Create evaluation set if validation data is provided
+                    eval_set = [(X_val, y_val)]
+
+                    xgb_model.fit(X_train, y_train, eval_set=eval_set, early_stopping_rounds=10, verbose=False)
+
+                    # Predict on validation set
+                    y_pred = xgb_model.predict(X_val)
+                    score = f1_score(y_val, y_pred)
+
+                    # Track parameters and score
+                    for key in search_space.keys():
+                        cv_results["param_" + key].append(params[key])
+                    cv_results["mean_test_score"].append(score)
+
+                    # Update best if needed
+                    if score > best_score:
+                        best_score = score
+                        best_params = params.copy()
+                        logger.info(
+                            f"New best XGB params (iter {i + 1}/{n_iterations}): {best_params}, F1: {best_score:.4f}")
+
+                results = {
+                    'best_params': best_params,
+                    'best_score': best_score,
+                    'all_results': cv_results
+                }
+                logger.info(f"XGB Best parameters: {best_params}")
+                logger.info(f"XGB Best score: {best_score}")
+
+                return best_params, results
+            else:
+                # Use BayesSearchCV with cross-validation if no validation data
+                logger.info("No validation data provided, using BayesSearchCV with TimeSeriesSplit")
+                optimizer = BayesSearchCV(
+                    model,
+                    search_space,
+                    n_iter=self.n_iter,
+                    cv=TimeSeriesSplit(n_splits=self.n_splits),
+                    scoring=self.scoring,
+                    n_jobs=self.n_jobs,
+                    verbose=1
+                )
+                optimizer.fit(X_train, y_train)
+                best_params = optimizer.best_params_
+                best_score = optimizer.best_score_
+
+                # Validate results
+                if not best_params:
+                    raise ValueError("BayesSearchCV returned empty best_params")
+
+                # Convert OrderedDict to dict
+                best_params = convert_ordered_dicts(best_params)
+
+                results = {
+                    'best_params': best_params,
+                    'best_score': best_score,
+                    'all_results': optimizer.cv_results_
+                }
+                logger.info(f"XGB Best parameters: {best_params}")
+                logger.info(f"XGB Best score: {best_score}")
+
+                return best_params, results
 
         except Exception as e:
             logger.error(f"Error in XGBoost optimization: {str(e)}")
@@ -215,7 +376,7 @@ class HyperparameterOptimizer:
                 'error': str(e)
             }
 
-            return best_params, results
+        return best_params, results
 
     def optimize_lstm(self, X_train: pd.DataFrame, y_train: pd.Series) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         logger.info("LSTM hyperparameter optimization is not implemented with BayesSearchCV.")
@@ -233,24 +394,37 @@ class HyperparameterOptimizer:
         logger.info(f"Default LSTM parameters: {best_params}")
         return best_params, results
 
-    def optimize_model(self, X_train: pd.DataFrame, y_train: pd.Series) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    def optimize_model(self, X_train: pd.DataFrame, y_train: pd.Series,
+                       X_val: pd.DataFrame = None, y_val: pd.Series = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """
+        Optimize model hyperparameters using training data and validation data.
+
+        Args:
+            X_train: Training features
+            y_train: Training target
+            X_val: Validation features
+            y_val: Validation target
+
+        Returns:
+            Tuple of (best_params, detailed_results)
+        """
         if self.model_type == ModelType.RANDOM_FOREST.value:
-            best_params, results = self.optimize_random_forest(X_train, y_train)
+            best_params, results = self.optimize_random_forest(X_train, y_train, X_val, y_val)
             best_params = self.validate_hyperparameters(best_params, ModelType.RANDOM_FOREST.value)
             return best_params, results
 
         elif self.model_type == ModelType.XGBOOST.value:
-            best_params, results = self.optimize_xgboost(X_train, y_train)
+            best_params, results = self.optimize_xgboost(X_train, y_train, X_val, y_val)
             best_params = self.validate_hyperparameters(best_params, ModelType.XGBOOST.value)
             return best_params, results
 
         elif self.model_type == ModelType.LSTM.value:
-            return self.optimize_lstm(X_train, y_train)
+            return self.optimize_lstm(X_train, y_train, X_val, y_val)
 
         elif self.model_type == ModelType.ENSEMBLE.value:
             logger.info("Optimizing ensemble models...")
-            rf_params, rf_results = self.optimize_random_forest(X_train, y_train)
-            xgb_params, xgb_results = self.optimize_xgboost(X_train, y_train)
+            rf_params, rf_results = self.optimize_random_forest(X_train, y_train, X_val, y_val)
+            xgb_params, xgb_results = self.optimize_xgboost(X_train, y_train, X_val, y_val)
 
             # Validate parameters to ensure they're not empty
             rf_params = self.validate_hyperparameters(rf_params, ModelType.RANDOM_FOREST.value)
@@ -287,19 +461,49 @@ def optimize_hyperparameters(config: Dict, timeframe: str) -> Dict:
     """Run hyperparameter optimization for the specified model type and timeframe."""
     try:
         print("Starting hyperparameter optimization")
-        storage = DataStorage(config_path="config/config.yaml")
-        processor = DataProcessor(config_path="config/config.yaml")
+        storage = DataStorage()
+        processor = DataProcessor()
 
-        # Find and load processed data
-        processed_files = storage.find_latest_processed_data()
-        print(f"Found processed files: {processed_files}")
+        # Use pre-split training and validation data
+        split_paths = storage.find_latest_split_data()
 
-        if timeframe not in processed_files:
-            raise ValueError(f"No processed data found for timeframe {timeframe}")
+        if "train" not in split_paths or timeframe not in split_paths["train"]:
+            raise ValueError(f"No training data found for timeframe {timeframe}")
 
-        data = processor.load_data({timeframe: processed_files[timeframe]})[timeframe]
-        logger.info(f"Loaded processed data for {timeframe}: {data.shape} rows")
-        print(f"Loaded processed data for {timeframe}: {data.shape} rows")
+        if "validation" not in split_paths or timeframe not in split_paths["validation"]:
+            logger.warning(f"No validation data found for {timeframe}. Will use part of training data for validation.")
+
+            # Load training data
+            train_data_dict = processor.load_data({timeframe: split_paths["train"][timeframe]})
+            train_data = train_data_dict[timeframe]
+            logger.info(f"Loaded training data: {len(train_data)} rows")
+
+            # Split training data for validation
+            train_ratio = config.get('data', {}).get('train_ratio', 0.8)
+            split_idx = int(len(train_data) * train_ratio)
+            train_subset = train_data.iloc[:split_idx]
+            val_subset = train_data.iloc[split_idx:]
+
+            # Prepare features
+            X_train, y_train = processor.prepare_ml_features(train_subset, horizon=1)
+            X_val, y_val = processor.prepare_ml_features(val_subset, horizon=1)
+        else:
+            # Load both training and validation data
+            train_data_dict = processor.load_data({timeframe: split_paths["train"][timeframe]})
+            val_data_dict = processor.load_data({timeframe: split_paths["validation"][timeframe]})
+
+            train_data = train_data_dict[timeframe]
+            val_data = val_data_dict[timeframe]
+
+            logger.info(f"Loaded training data: {len(train_data)} rows")
+            logger.info(f"Loaded validation data: {len(val_data)} rows")
+
+            # Prepare features
+            X_train, y_train = processor.prepare_ml_features(train_data, horizon=1)
+            X_val, y_val = processor.prepare_ml_features(val_data, horizon=1)
+
+        logger.info(f"Prepared training features shape: {X_train.shape}, target shape: {y_train.shape}")
+        logger.info(f"Prepared validation features shape: {X_val.shape}, target shape: {y_val.shape}")
 
         # Set up target variables
         target_type = config.get('model', {}).get('prediction_target', PredictionTarget.DIRECTION.value)
@@ -308,20 +512,11 @@ def optimize_hyperparameters(config: Dict, timeframe: str) -> Dict:
 
         print(f"Using target type: {target_type}, horizon: {horizon}")
 
-        if target_col not in data.columns:
+        if target_col not in train_data.columns:
             print(f"Creating target variable {target_col}")
-            data = processor.create_target_variable(data, target_type, horizon)
-
-        # Split data for training
-        split_ratio = config.get('data', {}).get('split_ratio', 0.8)
-        split_idx = int(len(data) * split_ratio)
-        train_data = data.iloc[:split_idx]
-        logger.info(f"Using {len(train_data)} rows for optimization ({split_ratio * 100:.0f}% of data)")
-        print(f"Using {len(train_data)} rows for optimization ({split_ratio * 100:.0f}% of data)")
-
-        # Prepare features and target
-        X_train, y_train = processor.prepare_ml_features(train_data, horizon)
-        print(f"Prepared features shape: {X_train.shape}, target shape: {y_train.shape}")
+            train_data = processor.create_target_variable(train_data, target_type, horizon)
+            if "validation" in split_paths and timeframe in split_paths["validation"]:
+                val_data = processor.create_target_variable(val_data, target_type, horizon)
 
         # Check for class balance in classification tasks
         if target_type in [PredictionTarget.DIRECTION.value, PredictionTarget.VOLATILITY.value]:
@@ -376,9 +571,9 @@ def optimize_hyperparameters(config: Dict, timeframe: str) -> Dict:
                 }
                 detailed_results = {'debug': True}
         else:
-            # Run actual optimization
+            # Run actual optimization with training and validation data
             print("Starting actual optimization (this may take a while)...")
-            best_params, detailed_results = optimizer.optimize_model(X_train, y_train)
+            best_params, detailed_results = optimizer.optimize_model(X_train, y_train, X_val, y_val)
             print(f"Optimization completed. Best params: {best_params}")
 
         # Convert OrderedDict to regular dict (again, to be sure)

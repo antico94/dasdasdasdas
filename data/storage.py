@@ -2,7 +2,7 @@ import os
 import pickle
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import joblib
 import pandas as pd
@@ -12,13 +12,102 @@ from utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 
+class PathManager:
+    """Manages file paths for data storage operations."""
+
+    def __init__(self, project_root: Path, config: Dict):
+        self.project_root = project_root
+        self.config = config
+
+        # Set up base paths
+        self.base_path = self._resolve_path(config["data"]["save_path"])
+        self.models_dir = self.project_root / "data_output" / "trained_models"
+        self.results_dir = self._resolve_path(config["data"].get("results_path", "data_output/results/models"))
+        self.train_path = self._resolve_path(config["data"].get("train_path", "data_output/processed_data/train"))
+        self.validation_path = self._resolve_path(
+            config["data"].get("validation_path", "data_output/processed_data/validation"))
+        self.test_path = self._resolve_path(config["data"].get("test_path", "data_output/processed_data/test"))
+        self.scalers_dir = self.project_root / "data_output" / "models" / "scalers"
+
+        # Create directories
+        self._create_dirs()
+
+    def _resolve_path(self, path_str: str) -> Path:
+        """Convert string path to absolute Path object."""
+        path = Path(path_str)
+        if not path.is_absolute():
+            return self.project_root / path
+        return path
+
+    def _create_dirs(self) -> None:
+        """Create all necessary directories."""
+        dirs = [
+            self.base_path,
+            self.models_dir,
+            self.results_dir,
+            self.train_path,
+            self.validation_path,
+            self.test_path,
+            self.scalers_dir
+        ]
+        for dir_path in dirs:
+            dir_path.mkdir(parents=True, exist_ok=True)
+
+    def get_split_path(self, split_type: str) -> Path:
+        """Get the path for a specific data split."""
+        if split_type == "train":
+            return self.train_path
+        elif split_type == "validation":
+            return self.validation_path
+        elif split_type == "test":
+            return self.test_path
+        else:
+            raise ValueError(f"Unknown split type: {split_type}")
+
+    def build_filename(self, name: str, suffix: str = "", include_timestamp: bool = True) -> str:
+        """Build a filename with optional timestamp."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") if include_timestamp else ""
+        if suffix:
+            return f"{name}_{suffix}_{timestamp}" if timestamp else f"{name}_{suffix}"
+        return f"{name}_{timestamp}" if timestamp else name
+
+
+class FileManager:
+    """Handles file operations like finding and matching files."""
+
+    @staticmethod
+    def find_latest_file(directory: Path, pattern: str) -> Optional[str]:
+        """Find the latest file matching a pattern in a directory."""
+        matching_files = list(directory.glob(pattern))
+        if not matching_files:
+            return None
+        latest_file = max(matching_files, key=lambda f: f.stat().st_ctime)
+        return str(latest_file)
+
+    @staticmethod
+    def find_files_by_pattern(directory: Path, pattern: str) -> List[str]:
+        """Find all files matching a pattern in a directory."""
+        matching_files = list(directory.glob(pattern))
+        return [str(f) for f in matching_files]
+
+
 class DataStorage:
+    """Handles storage and retrieval of data, models, and results."""
+
     def __init__(self, config_path: Optional[str] = None):
-        # Compute the project root based on the location of this file.
+        # Find project root
         current_file = Path(__file__).resolve()
         self.project_root = current_file.parents[1]  # e.g., C:/Users/ameiu/PycharmProjects/GoldML
 
-        # Determine the configuration file path.
+        # Load configuration
+        self.config = self._load_config(config_path)
+
+        # Initialize path and file managers
+        self.path_manager = PathManager(self.project_root, self.config)
+        self.file_manager = FileManager()
+
+    def _load_config(self, config_path: Optional[str] = None) -> Dict:
+        """Load configuration from file."""
         if config_path is None:
             config_path = self.project_root / "config" / "config.yaml"
         else:
@@ -28,55 +117,45 @@ class DataStorage:
         if not config_path.exists():
             raise FileNotFoundError(f"Configuration file not found at {config_path}")
 
-        # Load configuration.
         with open(config_path, "r") as file:
-            self.config = yaml.safe_load(file)
+            return yaml.safe_load(file)
 
-        # Convert the save_path (from config) to an absolute path relative to the project root.
-        save_path = self.config["data"]["save_path"]
-        save_path = Path(save_path)
-        if not save_path.is_absolute():
-            self.base_path = self.project_root / save_path
-        else:
-            self.base_path = save_path
-
-        # Ensure the base path exists.
-        self.base_path.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Base path set to: {self.base_path}")
+    # DataFrame Operations
 
     def save_dataframe(self, df: pd.DataFrame, name: str, include_timestamp: bool = True) -> str:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") if include_timestamp else ""
-        filename = f"{name}_{timestamp}.csv" if timestamp else f"{name}.csv"
-        filepath = self.base_path / filename
+        """Save DataFrame to CSV file."""
+        filename = self.path_manager.build_filename(name, include_timestamp=include_timestamp) + ".csv"
+        filepath = self.path_manager.base_path / filename
 
         df.to_csv(filepath)
         logger.info(f"Saved DataFrame to {filepath}")
         return str(filepath)
 
     def load_dataframe(self, filepath: str) -> pd.DataFrame:
+        """Load DataFrame from CSV file."""
         fp = Path(filepath)
         if not fp.exists():
             raise FileNotFoundError(f"File not found: {fp}")
+
         df = pd.read_csv(fp, index_col=0, parse_dates=True)
         logger.info(f"Loaded DataFrame from {fp}: {len(df)} rows, {df.shape[1]} columns")
         return df
 
-    def save_model(self, model: Any, name: str, include_timestamp: bool = True, metadata: Optional[Dict] = None) -> str:
-        # Build the models directory relative to the project root.
-        models_dir = self.project_root / "data_output" / "trained_models"
-        models_dir.mkdir(parents=True, exist_ok=True)
+    # Model Operations
 
-        # Create the file name; include timestamp only if desired.
+    def save_model(self, model: Any, name: str, include_timestamp: bool = True, metadata: Optional[Dict] = None) -> str:
+        """Save model to file with optional metadata."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") if include_timestamp else ""
         filename = f"{name}_{timestamp}.joblib" if timestamp else f"{name}.joblib"
-        filepath = models_dir / filename
+        filepath = self.path_manager.models_dir / filename
 
-        # Save the model.
+        # Save model
         joblib.dump(model, filepath)
 
+        # Save metadata if provided
         if metadata:
             metadata_filename = f"{name}_{timestamp}_metadata.pkl" if timestamp else f"{name}_metadata.pkl"
-            metadata_path = models_dir / metadata_filename
+            metadata_path = self.path_manager.models_dir / metadata_filename
             with open(metadata_path, "wb") as f:
                 pickle.dump(metadata, f)
             logger.info(f"Saved model metadata to {metadata_path}")
@@ -84,52 +163,40 @@ class DataStorage:
         logger.info(f"Saved model to {filepath}")
         return str(filepath)
 
-    def load_model(self, filepath: str) -> Any:
+    def load_model(self, filepath: str) -> Union[Any, Tuple[Any, Dict]]:
+        """Load model from file and optional metadata."""
         fp = Path(filepath)
         if not fp.exists():
             raise FileNotFoundError(f"Model file not found: {fp}")
+
+        # Load model
         model = joblib.load(fp)
         logger.info(f"Loaded model from {fp}")
 
-        # Load model metadata if available.
+        # Try to load metadata
         metadata_path = fp.with_name(fp.stem + "_metadata.pkl")
         if metadata_path.exists():
             with open(metadata_path, "rb") as f:
                 metadata = pickle.load(f)
             logger.info(f"Loaded model metadata: {list(metadata.keys())}")
             return model, metadata
+
         return model
 
-    def save_scaler(self, scaler: Any, name: str) -> str:
-        scalers_dir = self.project_root / "data_output" / "models" / "scalers"
-        scalers_dir.mkdir(parents=True, exist_ok=True)
-        filepath = scalers_dir / f"{name}_scaler.joblib"
-        joblib.dump(scaler, filepath)
-        logger.info(f"Saved scaler to {filepath}")
-        return str(filepath)
-
-    def load_scaler(self, filepath: str) -> Any:
-        fp = Path(filepath)
-        if not fp.exists():
-            raise FileNotFoundError(f"Scaler file not found: {fp}")
-        scaler = joblib.load(fp)
-        logger.info(f"Loaded scaler from {fp}")
-        return scaler
+    # Results Operations
 
     def save_results(self, results: Dict, name: str, include_timestamp: bool = True) -> str:
-        # Fetch results save path from config. If not set, use a default.
-        config_results_path = self.config["data"].get("results_path", "data_output/results/models")
-        results_dir = self.project_root / config_results_path
-        results_dir.mkdir(parents=True, exist_ok=True)
-
-        # Remove the .pkl extension from name if already present.
+        """Save results dictionary to file."""
+        # Remove .pkl extension if present
         if name.endswith(".pkl"):
             name = name[:-4]
 
+        # Create filename
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") if include_timestamp else ""
         filename = f"{name}_{timestamp}.pkl" if timestamp else f"{name}.pkl"
-        filepath = results_dir / filename
+        filepath = self.path_manager.results_dir / filename
 
+        # Save results
         with open(filepath, "wb") as f:
             pickle.dump(results, f)
 
@@ -137,27 +204,51 @@ class DataStorage:
         return str(filepath)
 
     def load_results(self, filepath: str) -> Dict:
+        """Load results dictionary from file."""
         fp = Path(filepath)
         if not fp.is_absolute():
-            # Assume relative to the default results directory.
-            fp = self.project_root / "data_output" / "results" / fp
+            # Assume relative to the default results directory
+            fp = self.path_manager.results_dir / fp
+
         if not fp.exists():
             raise FileNotFoundError(f"Results file not found: {fp}")
+
         with open(fp, "rb") as f:
             results = pickle.load(f)
+
         logger.info(f"Loaded results from {fp}")
         return results
 
+    # Scaler Operations
+
+    def save_scaler(self, scaler: Any, name: str) -> str:
+        """Save scaler to file."""
+        filepath = self.path_manager.scalers_dir / f"{name}_scaler.joblib"
+        joblib.dump(scaler, filepath)
+        logger.info(f"Saved scaler to {filepath}")
+        return str(filepath)
+
+    def load_scaler(self, filepath: str) -> Any:
+        """Load scaler from file."""
+        fp = Path(filepath)
+        if not fp.exists():
+            raise FileNotFoundError(f"Scaler file not found: {fp}")
+
+        scaler = joblib.load(fp)
+        logger.info(f"Loaded scaler from {fp}")
+        return scaler
+
+    # Data Finding Operations
+
     def find_latest_file(self, pattern: str) -> Optional[str]:
-        matching_files = list(self.base_path.glob(pattern))
-        if not matching_files:
-            return None
-        latest_file = max(matching_files, key=lambda f: f.stat().st_ctime)
-        return str(latest_file)
+        """Find the latest file matching a pattern in base path."""
+        return self.file_manager.find_latest_file(self.path_manager.base_path, pattern)
 
     def find_latest_data(self, symbol: Optional[str] = None, timeframe: Optional[str] = None) -> Dict[str, str]:
+        """Find the latest data files for a symbol and optional timeframe."""
         if symbol is None:
             symbol = self.config["data"]["symbol"]
+
         if timeframe:
             pattern = f"{symbol}_{timeframe}_*.csv"
             latest = self.find_latest_file(pattern)
@@ -172,26 +263,25 @@ class DataStorage:
             return latest_files
 
     def find_latest_processed_data(self, symbol: Optional[str] = None) -> Dict[str, str]:
+        """Find the latest processed data files for a symbol."""
         if symbol is None:
             symbol = self.config["data"]["symbol"]
+
         processed_files = {}
         for tf in self.config["data"]["timeframes"]:
             filename = f"{symbol}_{tf}_processed.csv"
-            file_path = self.base_path / filename
+            file_path = self.path_manager.base_path / filename
             if file_path.exists():
                 processed_files[tf] = str(file_path)
+
         return processed_files
 
     def find_latest_model(self, model_type: str) -> Optional[str]:
-        models_dir = self.project_root / "data_output" / "trained_models"
-        if not models_dir.exists():
-            return None
+        """Find the latest model file of a specific type."""
         pattern = f"{model_type}_*.joblib"
-        matching_files = list(models_dir.glob(pattern))
-        if not matching_files:
-            return None
-        latest_model = max(matching_files, key=lambda f: f.stat().st_ctime)
-        return str(latest_model)
+        return self.file_manager.find_latest_file(self.path_manager.models_dir, pattern)
+
+    # Split Data Operations
 
     def find_latest_split_data(self, symbol: Optional[str] = None, timeframe: Optional[str] = None) -> Dict[
         str, Dict[str, str]]:
@@ -199,27 +289,11 @@ class DataStorage:
         if symbol is None:
             symbol = self.config["data"]["symbol"]
 
-        split_paths = {
-            "train": {},
-            "validation": {},
-            "test": {}
-        }
+        split_paths = {"train": {}, "validation": {}, "test": {}}
 
-        # Get directory paths from config
-        train_path = Path(self.config["data"].get("train_path", "data_output/processed_data/train"))
-        validation_path = Path(self.config["data"].get("validation_path", "data_output/processed_data/validation"))
-        test_path = Path(self.config["data"].get("test_path", "data_output/processed_data/test"))
+        for split_type in split_paths.keys():
+            dir_path = self.path_manager.get_split_path(split_type)
 
-        # Convert to absolute paths if they're relative
-        if not train_path.is_absolute():
-            train_path = self.project_root / train_path
-        if not validation_path.is_absolute():
-            validation_path = self.project_root / validation_path
-        if not test_path.is_absolute():
-            test_path = self.project_root / test_path
-
-        # Find latest files in each directory
-        for split_type, dir_path in [("train", train_path), ("validation", validation_path), ("test", test_path)]:
             if not dir_path.exists():
                 logger.warning(f"Directory not found: {dir_path}")
                 continue
@@ -227,18 +301,16 @@ class DataStorage:
             if timeframe:
                 # Find latest file for specific timeframe
                 pattern = f"{symbol}_{timeframe}_*.csv"
-                matching_files = list(dir_path.glob(pattern))
-                if matching_files:
-                    latest_file = max(matching_files, key=lambda f: f.stat().st_ctime)
-                    split_paths[split_type][timeframe] = str(latest_file)
+                latest_file = self.file_manager.find_latest_file(dir_path, pattern)
+                if latest_file:
+                    split_paths[split_type][timeframe] = latest_file
             else:
                 # Find latest files for all timeframes
                 for tf in self.config["data"]["timeframes"]:
                     pattern = f"{symbol}_{tf}_*.csv"
-                    matching_files = list(dir_path.glob(pattern))
-                    if matching_files:
-                        latest_file = max(matching_files, key=lambda f: f.stat().st_ctime)
-                        split_paths[split_type][tf] = str(latest_file)
+                    latest_file = self.file_manager.find_latest_file(dir_path, pattern)
+                    if latest_file:
+                        split_paths[split_type][tf] = latest_file
 
         return split_paths
 
@@ -248,36 +320,12 @@ class DataStorage:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") if include_timestamp else ""
         saved_paths = {"train": {}, "validation": {}, "test": {}}
 
-        # Get directory paths from config
-        train_path = Path(self.config["data"].get("train_path", "data_output/processed_data/train"))
-        validation_path = Path(self.config["data"].get("validation_path", "data_output/processed_data/validation"))
-        test_path = Path(self.config["data"].get("test_path", "data_output/processed_data/test"))
-
-        # Convert to absolute paths if they're relative
-        if not train_path.is_absolute():
-            train_path = self.project_root / train_path
-        if not validation_path.is_absolute():
-            validation_path = self.project_root / validation_path
-        if not test_path.is_absolute():
-            test_path = self.project_root / test_path
-
-        # Create directories if they don't exist
-        train_path.mkdir(parents=True, exist_ok=True)
-        validation_path.mkdir(parents=True, exist_ok=True)
-        test_path.mkdir(parents=True, exist_ok=True)
-
-        # Save each split data
         for split_type, timeframe_data in split_data.items():
+            split_dir = self.path_manager.get_split_path(split_type)
+
             for tf, df in timeframe_data.items():
-                if split_type == "train":
-                    filename = f"{name}_{tf}_{timestamp}.csv" if timestamp else f"{name}_{tf}.csv"
-                    filepath = train_path / filename
-                elif split_type == "validation":
-                    filename = f"{name}_{tf}_{timestamp}.csv" if timestamp else f"{name}_{tf}.csv"
-                    filepath = validation_path / filename
-                else:  # test
-                    filename = f"{name}_{tf}_{timestamp}.csv" if timestamp else f"{name}_{tf}.csv"
-                    filepath = test_path / filename
+                filename = f"{name}_{tf}_{timestamp}.csv" if timestamp else f"{name}_{tf}.csv"
+                filepath = split_dir / filename
 
                 df.to_csv(filepath)
                 saved_paths[split_type][tf] = str(filepath)
@@ -309,54 +357,75 @@ class DataStorage:
         if symbol is None:
             symbol = self.config["data"]["symbol"]
 
-        # Create paths for each split
-        train_path = Path(self.config["data"].get("train_path", "data_output/processed_data/train"))
-        validation_path = Path(self.config["data"].get("validation_path", "data_output/processed_data/validation"))
-        test_path = Path(self.config["data"].get("test_path", "data_output/processed_data/test"))
-
-        # Convert to absolute paths if they're relative
-        if not train_path.is_absolute():
-            train_path = self.project_root / train_path
-        if not validation_path.is_absolute():
-            validation_path = self.project_root / validation_path
-        if not test_path.is_absolute():
-            test_path = self.project_root / test_path
-
         processed_files = {"train": {}, "validation": {}, "test": {}}
         suffix = "processed"
 
-        for split_type, path in [("train", train_path), ("validation", validation_path), ("test", test_path)]:
-            if not path.exists():
+        for split_type in processed_files.keys():
+            dir_path = self.path_manager.get_split_path(split_type)
+
+            if not dir_path.exists():
                 continue
 
             for tf in self.config["data"]["timeframes"]:
-                # Look for files with the processed suffix
+                # First try to find processed files
                 filename = f"{symbol}_{tf}_{suffix}.csv"
-                file_path = path / filename
+                file_path = dir_path / filename
+
                 if file_path.exists():
                     processed_files[split_type][tf] = str(file_path)
                 else:
-                    # If not found, try to find the latest file for this timeframe
+                    # Fall back to latest file for this timeframe
                     pattern = f"{symbol}_{tf}_*.csv"
-                    matching_files = list(path.glob(pattern))
-                    if matching_files:
-                        latest_file = max(matching_files, key=lambda f: f.stat().st_ctime)
-                        processed_files[split_type][tf] = str(latest_file)
+                    latest_file = self.file_manager.find_latest_file(dir_path, pattern)
+                    if latest_file:
+                        processed_files[split_type][tf] = latest_file
 
         return processed_files
 
+    def load_train_val_test_data(self, timeframe: str, processor: Any = None) -> Dict[
+        str, Tuple[pd.DataFrame, pd.Series]]:
+        """
+        Load pre-split train, validation, and test data for a specific timeframe.
 
-def main():
-    storage = DataStorage()
-    latest_files = storage.find_latest_data()
-    print("Latest data files:")
-    for tf, path in latest_files.items():
-        print(f"  {tf}: {path}")
-    processed_files = storage.find_latest_processed_data()
-    print("\nLatest processed data files:")
-    for tf, path in processed_files.items():
-        print(f"  {tf}: {path}")
+        Returns a dictionary with 'train', 'validation', and 'test' keys, each containing a tuple of (X, y).
+        """
+        split_paths = self.find_latest_split_data()
 
+        if processor is None:
+            # Import here to avoid circular imports
+            from data.processor import DataProcessor
+            processor = DataProcessor()
 
-if __name__ == "__main__":
-    main()
+        result = {}
+
+        # Load training data
+        if "train" in split_paths and timeframe in split_paths["train"]:
+            train_data_dict = processor.load_data({timeframe: split_paths["train"][timeframe]})
+            train_df = train_data_dict[timeframe]
+            X_train, y_train = processor.prepare_ml_features(train_df, horizon=1)
+            result['train'] = (X_train, y_train)
+            logger.info(f"Loaded training data: {len(train_df)} rows, {X_train.shape[1]} features")
+        else:
+            logger.warning(f"No training data found for {timeframe}")
+
+        # Load validation data
+        if "validation" in split_paths and timeframe in split_paths["validation"]:
+            val_data_dict = processor.load_data({timeframe: split_paths["validation"][timeframe]})
+            val_df = val_data_dict[timeframe]
+            X_val, y_val = processor.prepare_ml_features(val_df, horizon=1)
+            result['validation'] = (X_val, y_val)
+            logger.info(f"Loaded validation data: {len(val_df)} rows, {X_val.shape[1]} features")
+        else:
+            logger.warning(f"No validation data found for {timeframe}")
+
+        # Load test data
+        if "test" in split_paths and timeframe in split_paths["test"]:
+            test_data_dict = processor.load_data({timeframe: split_paths["test"][timeframe]})
+            test_df = test_data_dict[timeframe]
+            X_test, y_test = processor.prepare_ml_features(test_df, horizon=1)
+            result['test'] = (X_test, y_test)
+            logger.info(f"Loaded test data: {len(test_df)} rows, {X_test.shape[1]} features")
+        else:
+            logger.warning(f"No test data found for {timeframe}")
+
+        return result
