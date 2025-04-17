@@ -343,7 +343,9 @@ class DataProcessor:
             df = self.create_target_variable(df, horizon=horizon)
 
         if target_col not in df.columns:
-            raise ValueError(f"Failed to create target column '{target_col}'")
+            self.logger.error(f"Failed to create target column '{target_col}'")
+            # Return empty DataFrame and Series rather than raising an error
+            return pd.DataFrame(), pd.Series()
 
         self.logger.debug("Original DataFrame columns: %s", df.columns.tolist())
 
@@ -369,9 +371,13 @@ class DataProcessor:
             'buy_signal', 'sell_signal'
         ]
 
+        # Print all available columns for debugging
+        self.logger.info(f"Available columns in data: {df.columns.tolist()}")
+
         # Filter features based on availability
         available_features = [f for f in relevant_features if f in feature_cols]
         self.logger.info(f"Using {len(available_features)} relevant features for gold trading")
+        self.logger.info(f"Selected features: {available_features}")
 
         # Check for constant columns - only remove if explicitly requested
         constant_cols = []
@@ -392,88 +398,58 @@ class DataProcessor:
         valid_cols = [col for col in available_features if not df[col].isna().all()]
         if len(valid_cols) < len(available_features):
             self.logger.warning(f"Removed {len(available_features) - len(valid_cols)} columns that were entirely NaN")
+            self.logger.warning(f"Columns removed: {set(available_features) - set(valid_cols)}")
 
         self.logger.debug("Valid feature columns (non-all NaN): %s", valid_cols)
 
+        # Check if we have any valid features left
+        if not valid_cols:
+            self.logger.error("No valid features available after filtering")
+            return pd.DataFrame(), pd.Series()
+
         # Create feature matrix and target vector
-        X = df[valid_cols].copy()
-        y = df[target_col].copy()
+        try:
+            X = df[valid_cols].copy()
+            y = df[target_col].copy()
 
-        # Fill remaining NaN values with median
-        X = X.fillna(X.median())
+            # Fill remaining NaN values with median
+            X = X.fillna(X.median())
 
-        # Drop rows with remaining NaN values if requested
-        if drop_na:
-            na_mask = X.isna().any(axis=1) | y.isna()
-            if na_mask.any():
-                pre_drop_shape = X.shape
-                X = X[~na_mask].copy()
-                y = y[~na_mask].copy()
-                dropped = pre_drop_shape[0] - X.shape[0]
-                self.logger.debug("Dropped %d rows with NaNs. New shapes: X: %s, y: %s", dropped, X.shape, y.shape)
+            # Drop rows with remaining NaN values if requested
+            if drop_na:
+                na_mask = X.isna().any(axis=1) | y.isna()
+                if na_mask.any():
+                    pre_drop_shape = X.shape
+                    X = X[~na_mask].copy()
+                    y = y[~na_mask].copy()
+                    dropped = pre_drop_shape[0] - X.shape[0]
+                    self.logger.debug("Dropped %d rows with NaNs. New shapes: X: %s, y: %s", dropped, X.shape, y.shape)
 
-        self.logger.debug("Final ML features columns: %s", X.columns.tolist())
-        self.logger.debug("Final features shape: %s, Target shape: %s", X.shape, y.shape)
+            self.logger.debug("Final ML features columns: %s", X.columns.tolist())
+            self.logger.debug("Final features shape: %s, Target shape: %s", X.shape, y.shape)
 
-        # Final validation checks
-        if X.empty or y.empty:
-            raise ValueError("After filtering, no data remains for training. Check your data preprocessing steps.")
+            # Final validation checks
+            if X.empty or y.empty:
+                self.logger.error("After filtering, no data remains for training. Check your data preprocessing steps.")
+                return pd.DataFrame(), pd.Series()
 
-        if not y.empty:
-            class_counts = y.value_counts()
-            self.logger.info(f"Target class distribution: {class_counts}")
-            if len(class_counts) > 1:
-                min_class = class_counts.min()
-                max_class = class_counts.max()
-                if min_class / max_class < 0.1:
-                    self.logger.warning("Severe class imbalance detected in target variable!")
+            if not y.empty:
+                class_counts = y.value_counts()
+                self.logger.info(f"Target class distribution: {class_counts}")
+                if len(class_counts) > 1:
+                    min_class = class_counts.min()
+                    max_class = class_counts.max()
+                    if min_class / max_class < 0.1:
+                        self.logger.warning("Severe class imbalance detected in target variable!")
 
-        return X, y
+            return X, y
 
-    def prepare_ml_features_for_splits(
-            self,
-            split_data: Dict[str, Dict[str, pd.DataFrame]],
-            horizon: Optional[int] = None,
-            drop_na: bool = True,
-            remove_constant_cols: bool = True
-    ) -> Dict[str, Dict[str, Tuple[pd.DataFrame, pd.Series]]]:
-        """Prepare ML features for train, validation and test splits."""
-        prepared_data = {"train": {}, "validation": {}, "test": {}}
+        except Exception as e:
+            self.logger.error(f"Error in prepare_ml_features: {str(e)}")
+            import traceback
+            self.logger.error(f"Full error traceback: {traceback.format_exc()}")
+            return pd.DataFrame(), pd.Series()
 
-        for split_name, timeframe_data in split_data.items():
-            for timeframe, df in timeframe_data.items():
-                self.logger.info(f"Preparing ML features for {split_name} {timeframe} data")
-                X, y = self.prepare_ml_features(df, horizon, drop_na, remove_constant_cols)
-                prepared_data[split_name][timeframe] = (X, y)
-
-        return prepared_data
-
-    def save_processed_data(self, data_dict: Dict[str, pd.DataFrame], suffix: str = "processed") -> Dict[str, str]:
-        """Save processed data to CSV files."""
-        save_path = self.config["data"]["save_path"]
-        symbol = self.config["data"]["symbol"]
-
-        saved_paths = {}
-
-        for timeframe, df in data_dict.items():
-            # Check for constant columns before saving
-            constant_cols = []
-            for col in df.columns:
-                if df[col].nunique() <= 1:
-                    constant_cols.append(col)
-
-            if constant_cols:
-                self.logger.warning(
-                    f"Data for {timeframe} contains {len(constant_cols)} constant columns before saving: {constant_cols[:5]}...")
-
-            # Create path and save file
-            filename = os.path.join(save_path, f"{symbol}_{timeframe}_{suffix}.csv")
-            os.makedirs(os.path.dirname(filename), exist_ok=True)
-            df.to_csv(filename)
-            saved_paths[timeframe] = filename
-            self.logger.info(f"Saved processed data to {filename}")
-
-        return saved_paths
 
     def save_processed_split_data(self, split_data: Dict[str, Dict[str, pd.DataFrame]], suffix: str = "processed") -> \
     Dict[str, Dict[str, str]]:

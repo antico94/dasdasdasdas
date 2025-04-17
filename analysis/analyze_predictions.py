@@ -166,62 +166,83 @@ def generate_predictions(model, df, horizon=1):
 
     try:
         # Prepare features
+        logger.info(f"Preparing features for prediction with horizon={horizon}")
         X, y = processor.prepare_ml_features(df, horizon=horizon)
         logger.info(f"Prepared features shape: {X.shape}, target shape: {y.shape}")
 
         # Debug: Print class distribution
         actual_class_dist = y.value_counts(normalize=True)
         logger.info(f"Actual class distribution in test data: {actual_class_dist}")
-        logger.info(f"Class 1 (UP) proportion: {actual_class_dist.get(1, 0):.4f}")
-        logger.info(f"Class 0 (DOWN) proportion: {actual_class_dist.get(0, 0):.4f}")
 
-        # Get expected features from model metadata
+        # Load model metadata to get the expected feature names
+        model_metadata = None
         expected_features = []
 
-        # Check if model has metadata attribute
-        if hasattr(model, "metadata") and model.metadata:
-            expected_features = model.metadata.get("features", [])
+        # Try to get metadata from model file path
+        if hasattr(model, 'get_feature_importance'):
+            try:
+                # Try getting feature names from feature importance
+                feature_importance = model.get_feature_importance()
+                expected_features = list(feature_importance.keys())
+                logger.info(f"Got {len(expected_features)} feature names from feature_importance")
+            except Exception as e:
+                logger.error(f"Error getting feature importance: {str(e)}")
 
-        # If model has a get_feature_importance method, get features from there
-        elif hasattr(model, 'get_feature_importance'):
-            feature_importance = model.get_feature_importance()
-            expected_features = list(feature_importance.keys())
+        # If no expected features found, we need to extract them from the model
+        if not expected_features:
+            # For ensemble models, try to extract features from the first base estimator
+            if hasattr(model, 'estimators_') and len(model.estimators_) > 0:
+                base_model = model.estimators_[0]
+                if hasattr(base_model, 'feature_names_in_'):
+                    expected_features = base_model.feature_names_in_.tolist()
+                    logger.info(f"Got {len(expected_features)} feature names from first estimator")
+
+            # Try directly from model
+            if not expected_features and hasattr(model, 'feature_names_in_'):
+                expected_features = model.feature_names_in_.tolist()
+                logger.info(f"Got {len(expected_features)} feature names directly from model")
 
         if expected_features:
+            logger.info(f"Expected features (first 10): {expected_features[:10]}...")
+
             # Check for missing features
             missing_features = [feat for feat in expected_features if feat not in X.columns]
-
             if missing_features:
-                logger.warning(f"Adding missing features with default values: {missing_features}")
+                logger.warning(f"Adding {len(missing_features)} missing features with default values")
+                logger.info(f"Missing features (first 10): {missing_features[:10]}...")
 
                 # Add missing features with default values
                 for feature in missing_features:
-                    X[feature] = 0.0  # Use 0.0 as default value
+                    X[feature] = 0.0
 
-            # Ensure features are in the right order
+            # Check for extra features that weren't in the training data
+            extra_features = [feat for feat in X.columns if feat not in expected_features]
+            if extra_features:
+                logger.warning(f"Removing {len(extra_features)} extra features not seen during training")
+                logger.info(f"Extra features (first 10): {extra_features[:10]}...")
+
+                # Remove extra features
+                X = X.drop(columns=extra_features)
+
+            # Ensure columns are in the exact same order as during training
             X = X[expected_features]
-            logger.info(f"Using {len(expected_features)} features expected by the model")
+            logger.info(f"Final features shape after matching: {X.shape}")
         else:
-            logger.warning("No expected features found in model metadata. Using all available features.")
+            logger.warning("Could not determine expected features from model. Prediction may fail.")
 
         # Generate predictions
         logger.info("Generating predictions...")
         y_pred = model.predict(X)
+        logger.info(f"Successfully generated predictions for {len(y_pred)} samples")
 
         # Debug: Print prediction distribution
         pred_class_dist = pd.Series(y_pred).value_counts(normalize=True)
         logger.info(f"Prediction distribution: {pred_class_dist}")
-        logger.info(f"Class 1 (UP) predictions: {pred_class_dist.get(1, 0):.4f}")
-        logger.info(f"Class 0 (DOWN) predictions: {pred_class_dist.get(0, 0):.4f}")
 
         # Get probabilities if available
         if hasattr(model, 'predict_proba'):
             try:
                 probas = model.predict_proba(X)
-
-                # Debug: Print probability distribution
-                logger.info(f"UP probability stats: {pd.Series(probas[:, 1]).describe()}")
-                logger.info(f"DOWN probability stats: {pd.Series(probas[:, 0]).describe()}")
 
                 # Add predictions to dataframe
                 predictions_df = pd.DataFrame(index=X.index)
@@ -249,7 +270,7 @@ def generate_predictions(model, df, horizon=1):
     except Exception as e:
         logger.error(f"Error generating predictions: {str(e)}")
         import traceback
-        logger.error(traceback.format_exc())
+        logger.error(f"Full error traceback: {traceback.format_exc()}")
         return None
 
 
@@ -330,106 +351,137 @@ def analyze_prediction_accuracy(predictions_df):
     """Analyze prediction accuracy and confidence."""
     if predictions_df is None or len(predictions_df) == 0:
         logger.error("No predictions to analyze")
-        return None
+        return {
+            "overall_accuracy": 0,
+            "class_accuracy": {},
+            "error": "No predictions available"
+        }
 
     results = {}
 
-    # Overall accuracy
-    overall_accuracy = (predictions_df['actual'] == predictions_df['predicted']).mean()
-    results['overall_accuracy'] = overall_accuracy
+    try:
+        # Overall accuracy
+        overall_accuracy = (predictions_df['actual'] == predictions_df['predicted']).mean()
+        results['overall_accuracy'] = overall_accuracy
+    except Exception as e:
+        logger.error(f"Error calculating overall accuracy: {str(e)}")
+        results['overall_accuracy'] = 0
+        results['error_overall'] = str(e)
 
-    # Class-specific accuracy
-    class_accuracy = {}
-    for cls in predictions_df['actual'].unique():
-        cls_mask = predictions_df['actual'] == cls
-        if cls_mask.sum() > 0:
-            cls_acc = (predictions_df.loc[cls_mask, 'predicted'] == cls).mean()
-            class_accuracy[int(cls)] = {
-                'accuracy': cls_acc,
-                'samples': int(cls_mask.sum())
-            }
+    try:
+        # Class-specific accuracy
+        class_accuracy = {}
+        for cls in predictions_df['actual'].unique():
+            cls_mask = predictions_df['actual'] == cls
+            if cls_mask.sum() > 0:
+                cls_acc = (predictions_df.loc[cls_mask, 'predicted'] == cls).mean()
+                class_accuracy[int(cls)] = {
+                    'accuracy': cls_acc,
+                    'samples': int(cls_mask.sum())
+                }
 
-    results['class_accuracy'] = class_accuracy
+        results['class_accuracy'] = class_accuracy
+    except Exception as e:
+        logger.error(f"Error calculating class accuracy: {str(e)}")
+        results['class_accuracy'] = {}
+        results['error_class'] = str(e)
 
-    # Confusion matrix
-    from sklearn.metrics import confusion_matrix
-    cm = confusion_matrix(predictions_df['actual'], predictions_df['predicted'])
-    results['confusion_matrix'] = cm.tolist()
+    try:
+        # Confusion matrix
+        from sklearn.metrics import confusion_matrix
+        cm = confusion_matrix(predictions_df['actual'], predictions_df['predicted'])
+        results['confusion_matrix'] = cm.tolist()
+    except Exception as e:
+        logger.error(f"Error calculating confusion matrix: {str(e)}")
+        results['confusion_matrix'] = []
+        results['error_cm'] = str(e)
 
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False,
-                xticklabels=['Down', 'Up'], yticklabels=['Down', 'Up'])
-    plt.xlabel('Predicted')
-    plt.ylabel('Actual')
-    plt.title('Confusion Matrix')
+    try:
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False,
+                    xticklabels=['Down', 'Up'], yticklabels=['Down', 'Up'])
+        plt.xlabel('Predicted')
+        plt.ylabel('Actual')
+        plt.title('Confusion Matrix')
 
-    # Save plot
-    plots_dir = os.path.join(project_root, "analysis")
-    os.makedirs(plots_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    cm_plot_path = os.path.join(plots_dir, f"confusion_matrix_{timestamp}.png")
-    plt.savefig(cm_plot_path)
-    results['confusion_matrix_plot'] = cm_plot_path
-    plt.close()
+        # Save plot
+        plots_dir = os.path.join(project_root, "analysis")
+        os.makedirs(plots_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        cm_plot_path = os.path.join(plots_dir, f"confusion_matrix_{timestamp}.png")
+        plt.savefig(cm_plot_path)
+        results['confusion_matrix_plot'] = cm_plot_path
+        plt.close()
+    except Exception as e:
+        logger.error(f"Error creating confusion matrix plot: {str(e)}")
+        results['error_cm_plot'] = str(e)
 
     # Analyze confidence levels if available
     if 'confidence' in predictions_df.columns:
-        confidence_results = {}
+        try:
+            confidence_results = {}
 
-        # Confidence stats
-        conf_stats = predictions_df['confidence'].describe()
-        confidence_results['stats'] = {
-            'min': float(conf_stats['min']),
-            'max': float(conf_stats['max']),
-            'mean': float(conf_stats['mean']),
-            'std': float(conf_stats['std']),
-            'median': float(conf_stats['50%'])
-        }
-
-        # Accuracy by confidence level (fix deprecated warning)
-        conf_bins = np.linspace(0.5, 1, num=6)
-        conf_groups = pd.cut(predictions_df['confidence'], bins=conf_bins)
-        accuracy_by_conf = predictions_df.groupby(conf_groups, observed=True).apply(
-            lambda x: (x['actual'] == x['predicted']).mean() if len(x) > 0 else np.nan
-        ).dropna()
-
-        samples_by_conf = predictions_df.groupby(conf_groups, observed=True).size()
-
-        # Store results
-        confidence_results['by_level'] = {}
-        for conf_range, acc in accuracy_by_conf.items():
-            samples = samples_by_conf.get(conf_range, 0)
-            confidence_results['by_level'][str(conf_range)] = {
-                'accuracy': float(acc),
-                'samples': int(samples),
-                'percentage': float(samples / len(predictions_df) * 100)
+            # Confidence stats
+            conf_stats = predictions_df['confidence'].describe()
+            confidence_results['stats'] = {
+                'min': float(conf_stats['min']),
+                'max': float(conf_stats['max']),
+                'mean': float(conf_stats['mean']),
+                'std': float(conf_stats['std']),
+                'median': float(conf_stats['50%'])
             }
 
-        results['confidence'] = confidence_results
+            # Accuracy by confidence level (fix deprecated warning)
+            conf_bins = np.linspace(0.5, 1, num=6)
+            conf_groups = pd.cut(predictions_df['confidence'], bins=conf_bins)
+            accuracy_by_conf = predictions_df.groupby(conf_groups, observed=True).apply(
+                lambda x: (x['actual'] == x['predicted']).mean() if len(x) > 0 else np.nan
+            ).dropna()
 
-        # Plot accuracy by confidence
-        plt.figure(figsize=(10, 6))
-        ax = accuracy_by_conf.plot(kind='bar', color='skyblue')
+            samples_by_conf = predictions_df.groupby(conf_groups, observed=True).size()
 
-        # Add sample counts
-        for i, v in enumerate(accuracy_by_conf):
-            samples = samples_by_conf.iloc[i]
-            ax.text(i, v + 0.02, f"{samples} samples", ha='center')
+            # Store results
+            confidence_results['by_level'] = {}
+            for conf_range, acc in accuracy_by_conf.items():
+                samples = samples_by_conf.get(conf_range, 0)
+                confidence_results['by_level'][str(conf_range)] = {
+                    'accuracy': float(acc),
+                    'samples': int(samples),
+                    'percentage': float(samples / len(predictions_df) * 100)
+                }
 
-        plt.title('Accuracy by Confidence Level')
-        plt.xlabel('Confidence Range')
-        plt.ylabel('Accuracy')
-        plt.ylim(0, 1)
-        plt.grid(True, axis='y', alpha=0.3)
+            results['confidence'] = confidence_results
+        except Exception as e:
+            logger.error(f"Error analyzing confidence levels: {str(e)}")
+            results['confidence'] = {}
+            results['error_confidence'] = str(e)
 
-        # Save plot
-        conf_plot_path = os.path.join(plots_dir, f"accuracy_by_confidence_{timestamp}.png")
-        plt.savefig(conf_plot_path)
-        results['confidence_plot'] = conf_plot_path
-        plt.close()
+        try:
+            # Plot accuracy by confidence
+            plt.figure(figsize=(10, 6))
+            ax = accuracy_by_conf.plot(kind='bar', color='skyblue')
+
+            # Add sample counts
+            for i, v in enumerate(accuracy_by_conf):
+                samples = samples_by_conf.iloc[i]
+                ax.text(i, v + 0.02, f"{samples} samples", ha='center')
+
+            plt.title('Accuracy by Confidence Level')
+            plt.xlabel('Confidence Range')
+            plt.ylabel('Accuracy')
+            plt.ylim(0, 1)
+            plt.grid(True, axis='y', alpha=0.3)
+
+            # Save plot
+            conf_plot_path = os.path.join(plots_dir, f"accuracy_by_confidence_{timestamp}.png")
+            plt.savefig(conf_plot_path)
+            results['confidence_plot'] = conf_plot_path
+            plt.close()
+        except Exception as e:
+            logger.error(f"Error creating confidence plot: {str(e)}")
+            results['error_conf_plot'] = str(e)
 
     return results
-
 
 def analyze_consecutive_predictions(predictions_df):
     """Analyze consecutive predictions of the same type."""
@@ -664,80 +716,143 @@ def analyze_predictions(model_path: str, timeframe: str = 'H1', date_range: Opti
     logger.info(
         f"Parameters: timeframe={timeframe}, use_test_data={use_test_data}, confidence_threshold={confidence_threshold}")
 
-    # Load model and data
-    model, model_info, data_info = load_model_and_data(
-        model_path=model_path,
-        timeframe=timeframe,
-        date_range=date_range,
-        use_test_data=use_test_data
-    )
-
-    if model is None:
-        logger.error("Failed to load model")
-        return {'error': 'Failed to load model'}
-
-    if data_info is None:
-        logger.error("Failed to load data")
-        return {'error': 'Failed to load data'}
-
-    df, horizon = data_info
-
-    # Generate predictions
-    predictions_df = generate_predictions(model, df, horizon)
-
-    if predictions_df is None or len(predictions_df) == 0:
-        logger.error("Failed to generate predictions")
-        return {'error': 'Failed to generate predictions'}
-
-    # Run analyses and collect results
-    results = {'model_info': model_info, 'time_analysis': analyze_predictions_over_time(predictions_df, df),
-               'accuracy_analysis': analyze_prediction_accuracy(predictions_df),
-               'consecutive_analysis': analyze_consecutive_predictions(predictions_df),
-               'price_analysis': analyze_price_movement_vs_prediction(predictions_df, df),
-               'trading_opportunities': check_trading_opportunities(
-                   predictions_df,
-                   confidence_threshold=confidence_threshold
-               )}
-
-    # Create summary statistics
-    summary = {
-        "Model": os.path.basename(model_path),
-        "Timeframe": timeframe,
-        "Data Period": f"{model_info['data_period']['start']} to {model_info['data_period']['end']}",
-        "Overall Accuracy": f"{results['accuracy_analysis']['overall_accuracy']:.4f}",
+    # Initialize results dict with a basic summary in case of early errors
+    results = {
+        'summary': {
+            "Status": "Initializing",
+            "Model": os.path.basename(model_path) if model_path else "Unknown"
+        }
     }
 
-    if 1 in results['accuracy_analysis']['class_accuracy']:
-        summary["Win Rate Class 1 (UP)"] = f"{results['accuracy_analysis']['class_accuracy'][1]['accuracy']:.4f}"
-
-    if 'confidence' in results['accuracy_analysis']:
-        summary["Avg Confidence"] = f"{results['accuracy_analysis']['confidence']['stats']['mean']:.4f}"
-
-    if 'trading_opportunities' in results and results['trading_opportunities']:
-        summary["Recent Signals"] = f"UP: {results['trading_opportunities']['signals_summary']['up']['count']}, " \
-                                    f"DOWN: {results['trading_opportunities']['signals_summary']['down']['count']}"
-
-        # Add latest signal info
-        if 'latest_signal' in results['trading_opportunities']:
-            latest = results['trading_opportunities']['latest_signal']
-            summary["Latest Signal"] = f"{latest['direction']} ({latest['confidence']:.2f})"
-            summary["Trade Opportunity"] = "Yes" if latest['is_trading_opportunity'] else "No"
-
-    results['summary'] = summary
-
-    # Generate HTML report if report_generator exists
     try:
-        from debug_tools.report_generator_analyze_predictions import generate_html_report
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_name = f"prediction_analysis_{os.path.basename(model_path)}_{timestamp}.html"
-        report_dir = os.path.join(project_root, "analysis")
-        os.makedirs(report_dir, exist_ok=True)
-        report_path = os.path.join(report_dir, report_name)
-        generate_html_report(results, report_path)
-        logger.info(f"HTML report generated: {report_path}")
-        results['report_path'] = report_path
-    except ImportError:
-        logger.warning("Report generator module not found. No HTML report will be generated.")
-        results['report_path'] = None
+        # Load model and data
+        model, model_info, data_info = load_model_and_data(
+            model_path=model_path,
+            timeframe=timeframe,
+            date_range=date_range,
+            use_test_data=use_test_data
+        )
 
-    return results
+        if model is None:
+            logger.error("Failed to load model")
+            results['summary']["Status"] = "Failed"
+            results['summary']["Error"] = "Failed to load model"
+            return results
+
+        if data_info is None:
+            logger.error("Failed to load data")
+            results['summary']["Status"] = "Failed"
+            results['summary']["Error"] = "Failed to load data"
+            return results
+
+        df, horizon = data_info
+
+        # Update summary with basic model info
+        results['summary']["Timeframe"] = timeframe
+        results['summary']["Model"] = os.path.basename(model_path)
+        results['model_info'] = model_info
+
+        # Generate predictions
+        predictions_df = generate_predictions(model, df, horizon)
+
+        if predictions_df is None or len(predictions_df) == 0:
+            logger.error("Failed to generate predictions")
+            results['summary']["Status"] = "Failed"
+            results['summary']["Error"] = "Failed to generate predictions"
+            return results
+
+        # Update summary with prediction data
+        results['summary']["Status"] = "Running Analysis"
+        results['summary'][
+            "Data Period"] = f"{model_info['data_period']['start']} to {model_info['data_period']['end']}"
+
+        # Run analyses and collect results
+        try:
+            logger.info("Running time analysis...")
+            results['time_analysis'] = analyze_predictions_over_time(predictions_df, df)
+        except Exception as e:
+            logger.error(f"Error in time analysis: {str(e)}")
+            results['time_analysis'] = {"error": str(e)}
+
+        try:
+            logger.info("Running accuracy analysis...")
+            results['accuracy_analysis'] = analyze_prediction_accuracy(predictions_df)
+
+            # Update summary with accuracy info if available
+            if results['accuracy_analysis'] and 'overall_accuracy' in results['accuracy_analysis']:
+                results['summary']["Overall Accuracy"] = f"{results['accuracy_analysis']['overall_accuracy']:.4f}"
+
+                if 'class_accuracy' in results['accuracy_analysis'] and 1 in results['accuracy_analysis'][
+                    'class_accuracy']:
+                    results['summary'][
+                        "Win Rate Class 1 (UP)"] = f"{results['accuracy_analysis']['class_accuracy'][1]['accuracy']:.4f}"
+        except Exception as e:
+            logger.error(f"Error in accuracy analysis: {str(e)}")
+            results['accuracy_analysis'] = {"error": str(e)}
+
+        try:
+            logger.info("Running consecutive analysis...")
+            results['consecutive_analysis'] = analyze_consecutive_predictions(predictions_df)
+        except Exception as e:
+            logger.error(f"Error in consecutive analysis: {str(e)}")
+            results['consecutive_analysis'] = {"error": str(e)}
+
+        try:
+            logger.info("Running price analysis...")
+            results['price_analysis'] = analyze_price_movement_vs_prediction(predictions_df, df)
+        except Exception as e:
+            logger.error(f"Error in price analysis: {str(e)}")
+            results['price_analysis'] = {"error": str(e)}
+
+        try:
+            logger.info("Checking for trading opportunities...")
+            results['trading_opportunities'] = check_trading_opportunities(
+                predictions_df,
+                confidence_threshold=confidence_threshold
+            )
+
+            # Update summary with trading opportunities info if available
+            if results['trading_opportunities']:
+                if 'signals_summary' in results['trading_opportunities']:
+                    signals = results['trading_opportunities']['signals_summary']
+                    results['summary'][
+                        "Recent Signals"] = f"UP: {signals['up']['count']}, DOWN: {signals['down']['count']}"
+
+                if 'latest_signal' in results['trading_opportunities']:
+                    latest = results['trading_opportunities']['latest_signal']
+                    results['summary']["Latest Signal"] = f"{latest['direction']} ({latest['confidence']:.2f})"
+                    results['summary']["Trade Opportunity"] = "Yes" if latest['is_trading_opportunity'] else "No"
+        except Exception as e:
+            logger.error(f"Error checking trading opportunities: {str(e)}")
+            results['trading_opportunities'] = {"error": str(e)}
+
+        # Final status update
+        results['summary']["Status"] = "Success"
+
+        # Generate HTML report if report_generator exists
+        try:
+            from debug_tools.report_generator_analyze_predictions import generate_html_report
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            report_name = f"prediction_analysis_{os.path.basename(model_path)}_{timestamp}.html"
+            report_dir = os.path.join(project_root, "analysis")
+            os.makedirs(report_dir, exist_ok=True)
+            report_path = os.path.join(report_dir, report_name)
+            generate_html_report(results, report_path)
+            logger.info(f"HTML report generated: {report_path}")
+            results['report_path'] = report_path
+        except ImportError:
+            logger.warning("Report generator module not found. No HTML report will be generated.")
+            results['report_path'] = None
+        except Exception as e:
+            logger.error(f"Error generating HTML report: {str(e)}")
+            results['report_path'] = None
+
+        return results
+
+    except Exception as e:
+        logger.exception(f"Error in analyze_predictions: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        results['summary']["Status"] = "Failed"
+        results['summary']["Error"] = str(e)
+        return results
