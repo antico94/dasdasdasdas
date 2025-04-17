@@ -1,128 +1,28 @@
 import os
-import sys
-import joblib
 import numpy as np
 import pandas as pd
-# Fix matplotlib backend to avoid GUI dependencies
 import matplotlib
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 import seaborn as sns
-import questionary
-from questionary import Choice, Separator
+from typing import Dict, Tuple, List, Optional
+import joblib
+import sys
 
+# Fix matplotlib backend to avoid GUI dependencies
 matplotlib.use('Agg')
 
-# Add project root to path
+# Ensure project root is in path
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(script_dir)
 sys.path.append(project_root)
 
 from data.storage import DataStorage
 from data.processor import DataProcessor
-from utils.logger import setup_logger
 from models.factory import ModelFactory
-
-# Import the report generator if it exists
-try:
-    from debug_tools.report_generator_analyze_predictions import generate_html_report
-
-    has_report_generator = True
-except ImportError:
-    has_report_generator = False
-    print("Warning: report_generator.py not found. Reports will not be generated.")
-    print("Please make sure report_generator.py is in the debug_tools directory.")
+from utils.logger import setup_logger
 
 logger = setup_logger("PredictionAnalyzer")
-
-
-def select_model():
-    """Let the user select a model using questionary interface."""
-    # Find model files
-    models_dir = os.path.join(project_root, "data_output", "trained_models")
-    if not os.path.exists(models_dir):
-        logger.error("Models directory not found at: " + models_dir)
-        return None
-
-    model_files = [f for f in os.listdir(models_dir) if
-                   f.endswith('.joblib') and not f.endswith('_random_forest.joblib')
-                   and not f.endswith('_xgboost.joblib')
-                   and not f.endswith('_metadata.pkl')]
-
-    if not model_files:
-        logger.error("No model files found in: " + models_dir)
-        return None
-
-    # Sort by creation time (most recent first)
-    model_files.sort(key=lambda x: os.path.getctime(os.path.join(models_dir, x)), reverse=True)
-
-    # Create choices for questionary
-    choices = []
-    for i, model_file in enumerate(model_files):
-        file_path = os.path.join(models_dir, model_file)
-        created_time = datetime.fromtimestamp(os.path.getctime(file_path))
-        choices.append(Choice(
-            f"{model_file} (created: {created_time.strftime('%Y-%m-%d %H:%M:%S')})",
-            file_path
-        ))
-
-    # Add "Use latest model" as the first option
-    if model_files:
-        choices.insert(0, Choice(
-            f"Use latest model: {model_files[0]}",
-            os.path.join(models_dir, model_files[0])
-        ))
-
-    # Ask user to select a model
-    selected_model = questionary.select(
-        "Select a model to analyze:",
-        choices=choices
-    ).ask()
-
-    if selected_model:
-        print(f"Selected model: {os.path.basename(selected_model)}")
-        return selected_model
-    else:
-        # If user cancels, use the latest model
-        if model_files:
-            default_model = os.path.join(models_dir, model_files[0])
-            print(f"Using latest model: {model_files[0]}")
-            return default_model
-        return None
-
-
-def _is_valid_date(date_str):
-    """Validate date string format."""
-    try:
-        datetime.strptime(date_str, '%Y-%m-%d')
-        return True
-    except ValueError:
-        return 'Invalid date format. Please use YYYY-MM-DD'
-
-
-def clear_screen():
-    """Clear terminal screen."""
-    os.system('cls' if os.name == 'nt' else 'clear')
-
-
-def show_banner():
-    """Display banner for the prediction analyzer."""
-    clear_screen()
-    banner = """
-╔══════════════════════════════════════════════════════════════════╗
-║                                                                  ║
-║   ██████╗ ██████╗ ███████╗██████╗ ██╗ ██████╗████████╗          ║
-║   ██╔══██╗██╔══██╗██╔════╝██╔══██╗██║██╔════╝╚══██╔══╝          ║
-║   ██████╔╝██████╔╝█████╗  ██║  ██║██║██║        ██║             ║
-║   ██╔═══╝ ██╔══██╗██╔══╝  ██║  ██║██║██║        ██║             ║
-║   ██║     ██║  ██║███████╗██████╔╝██║╚██████╗   ██║             ║
-║   ╚═╝     ╚═╝  ╚═╝╚══════╝╚═════╝ ╚═╝ ╚═════╝   ╚═╝             ║
-║                                                                  ║
-║   XAUUSD Gold Trading Model Analysis Tool                        ║
-║                                                                  ║
-╚══════════════════════════════════════════════════════════════════╝
-    """
-    print(banner)
 
 
 def load_model_and_data(model_path=None, timeframe='H1', date_range=None, use_test_data=True):
@@ -143,9 +43,21 @@ def load_model_and_data(model_path=None, timeframe='H1', date_range=None, use_te
 
     # Find the latest model if not specified
     if model_path is None:
-        model_path = select_model()
-        if model_path is None:
-            logger.error("No model selected. Exiting.")
+        models_dir = os.path.join(project_root, "data_output", "trained_models")
+        if os.path.exists(models_dir):
+            model_files = [f for f in os.listdir(models_dir) if
+                           f.endswith('.joblib') and not f.endswith('_random_forest.joblib')
+                           and not f.endswith('_xgboost.joblib')
+                           and not f.endswith('_metadata.pkl')]
+            if model_files:
+                model_files.sort(key=lambda x: os.path.getctime(os.path.join(models_dir, x)), reverse=True)
+                model_path = os.path.join(models_dir, model_files[0])
+                logger.info(f"Using latest model: {model_files[0]}")
+            else:
+                logger.error("No model files found")
+                return None, None, None
+        else:
+            logger.error("Models directory not found")
             return None, None, None
 
     # Load model using ModelFactory
@@ -257,6 +169,9 @@ def generate_predictions(model, df, horizon=1):
         X, y = processor.prepare_ml_features(df, horizon=horizon)
         logger.info(f"Prepared features shape: {X.shape}, target shape: {y.shape}")
 
+        # Debug: Print raw class distribution
+        logger.info(f"Actual class distribution: {y.value_counts(normalize=True)}")
+
         # Get expected features from model metadata
         expected_features = []
 
@@ -287,20 +202,38 @@ def generate_predictions(model, df, horizon=1):
             logger.warning("No expected features found in model metadata. Using all available features.")
 
         # Generate predictions
+        logger.info("Generating predictions...")
         y_pred = model.predict(X)
+
+        # Debug: Print prediction distribution
+        unique_preds, counts = np.unique(y_pred, return_counts=True)
+        logger.info(f"Prediction distribution: {dict(zip(unique_preds, counts))}")
 
         # Get probabilities if available
         if hasattr(model, 'predict_proba'):
-            probas = model.predict_proba(X)
-            # Add predictions to dataframe
-            predictions_df = pd.DataFrame(index=X.index)
-            predictions_df['actual'] = y
-            predictions_df['predicted'] = y_pred
-            if probas is not None and probas.shape[1] >= 2:
-                predictions_df['probability_up'] = probas[:, 1]
-                predictions_df['probability_down'] = probas[:, 0]
-                predictions_df['confidence'] = np.max(probas, axis=1)
-            return predictions_df
+            try:
+                probas = model.predict_proba(X)
+
+                # Debug: Print probability distribution
+                logger.info(f"UP probability stats: {pd.Series(probas[:, 1]).describe()}")
+                logger.info(f"DOWN probability stats: {pd.Series(probas[:, 0]).describe()}")
+
+                # Add predictions to dataframe
+                predictions_df = pd.DataFrame(index=X.index)
+                predictions_df['actual'] = y
+                predictions_df['predicted'] = y_pred
+                if probas is not None and probas.shape[1] >= 2:
+                    predictions_df['probability_up'] = probas[:, 1]
+                    predictions_df['probability_down'] = probas[:, 0]
+                    predictions_df['confidence'] = np.max(probas, axis=1)
+                return predictions_df
+            except Exception as e:
+                logger.error(f"Error generating prediction probabilities: {str(e)}")
+                # If predict_proba fails, create dataframe without probabilities
+                predictions_df = pd.DataFrame(index=X.index)
+                predictions_df['actual'] = y
+                predictions_df['predicted'] = y_pred
+                return predictions_df
         else:
             # Add predictions to dataframe without probabilities
             predictions_df = pd.DataFrame(index=X.index)
@@ -719,280 +652,89 @@ def check_trading_opportunities(predictions_df, confidence_threshold=0.6):
     return results
 
 
-def main_menu():
-    """Show main menu for prediction analyzer."""
-    show_banner()
+def analyze_predictions(model_path: str, timeframe: str = 'H1', date_range: Optional[Tuple[str, str]] = None,
+                        use_test_data: bool = True, confidence_threshold: float = 0.65) -> Dict:
+    """Main function to analyze model predictions."""
+    logger.info(f"Starting prediction analysis for model: {model_path}")
+    logger.info(
+        f"Parameters: timeframe={timeframe}, use_test_data={use_test_data}, confidence_threshold={confidence_threshold}")
 
-    # Default configuration
-    default_config = {
-        'model_path': None,  # Will be set during load if None
-        'timeframe': 'H1',
-        'confidence_threshold': 0.65,
-        'date_range': None,  # Will be None for all data, or a tuple of (start_date, end_date)
-        'generate_report': True,
-        'report_path': None  # Will be auto-generated if None
+    # Load model and data
+    model, model_info, data_info = load_model_and_data(
+        model_path=model_path,
+        timeframe=timeframe,
+        date_range=date_range,
+        use_test_data=use_test_data
+    )
+
+    if model is None:
+        logger.error("Failed to load model")
+        return {'error': 'Failed to load model'}
+
+    if data_info is None:
+        logger.error("Failed to load data")
+        return {'error': 'Failed to load data'}
+
+    df, horizon = data_info
+
+    # Generate predictions
+    predictions_df = generate_predictions(model, df, horizon)
+
+    if predictions_df is None or len(predictions_df) == 0:
+        logger.error("Failed to generate predictions")
+        return {'error': 'Failed to generate predictions'}
+
+    # Run analyses and collect results
+    results = {}
+    results['model_info'] = model_info
+    results['time_analysis'] = analyze_predictions_over_time(predictions_df, df)
+    results['accuracy_analysis'] = analyze_prediction_accuracy(predictions_df)
+    results['consecutive_analysis'] = analyze_consecutive_predictions(predictions_df)
+    results['price_analysis'] = analyze_price_movement_vs_prediction(predictions_df, df)
+    results['trading_opportunities'] = check_trading_opportunities(
+        predictions_df,
+        confidence_threshold=confidence_threshold
+    )
+
+    # Create summary statistics
+    summary = {
+        "Model": os.path.basename(model_path),
+        "Timeframe": timeframe,
+        "Data Period": f"{model_info['data_period']['start']} to {model_info['data_period']['end']}",
+        "Overall Accuracy": f"{results['accuracy_analysis']['overall_accuracy']:.4f}",
     }
 
-    # Defaults display
-    print("\nCurrent Configuration:")
-    print(f"- Model: Will use latest model")
-    print(f"- Timeframe: {default_config['timeframe']}")
-    print(f"- Confidence threshold: {default_config['confidence_threshold']}")
-    print(f"- Date range: All available data")
+    if 1 in results['accuracy_analysis']['class_accuracy']:
+        summary["Win Rate Class 1 (UP)"] = f"{results['accuracy_analysis']['class_accuracy'][1]['accuracy']:.4f}"
 
-    use_defaults = questionary.select(
-        'How would you like to proceed?',
-        choices=[
-            Choice('Run analysis with current configuration', 'use_defaults'),
-            Choice('Change configuration settings', 'change_config')
-        ]
-    ).ask()
+    if 'confidence' in results['accuracy_analysis']:
+        summary["Avg Confidence"] = f"{results['accuracy_analysis']['confidence']['stats']['mean']:.4f}"
 
-    if use_defaults == 'use_defaults':
-        # Ensure default config has a valid report path
-        report_name = f"model_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
-        default_config['report_path'] = os.path.join(project_root, "analysis", report_name)
-        os.makedirs(os.path.join(project_root, "analysis"), exist_ok=True)
-        return default_config
+    if 'trading_opportunities' in results and results['trading_opportunities']:
+        summary["Recent Signals"] = f"UP: {results['trading_opportunities']['signals_summary']['up']['count']}, " \
+                                    f"DOWN: {results['trading_opportunities']['signals_summary']['down']['count']}"
 
-    # Custom configuration
-    config = default_config.copy()
+        # Add latest signal info
+        if 'latest_signal' in results['trading_opportunities']:
+            latest = results['trading_opportunities']['latest_signal']
+            summary["Latest Signal"] = f"{latest['direction']} ({latest['confidence']:.2f})"
+            summary["Trade Opportunity"] = "Yes" if latest['is_trading_opportunity'] else "No"
 
-    # Let user select the model
-    model_path = select_model()
-    if model_path:
-        config['model_path'] = model_path
+    results['summary'] = summary
 
-    # Select timeframe
-    config['timeframe'] = questionary.select(
-        'Select timeframe for analysis:',
-        choices=[
-            Choice('M5 (5 minutes)', 'M5'),
-            Choice('M15 (15 minutes)', 'M15'),
-            Choice('H1 (1 hour)', 'H1'),
-            Choice('D1 (Daily)', 'D1'),
-        ],
-        default=default_config['timeframe']
-    ).ask()
-
-    # Set confidence threshold
-    threshold_input = questionary.text(
-        'Enter confidence threshold for trading opportunities (0.5-1.0):',
-        default=str(default_config['confidence_threshold']),
-        validate=lambda val: (val.replace('.', '', 1).isdigit() and 0.5 <= float(
-            val) <= 1.0) or 'Enter a number between 0.5 and 1.0'
-    ).ask()
-    config['confidence_threshold'] = float(threshold_input)
-
-    # Date range selection
-    date_range_type = questionary.select(
-        'Which data range would you like to analyze?',
-        choices=[
-            Choice('All available data', 'all'),
-            Choice('Last N days', 'last_n_days'),
-            Choice('Custom date range', 'custom'),
-            Choice('Random period', 'random')
-        ]
-    ).ask()
-
-    if date_range_type == 'all':
-        config['date_range'] = None
-    elif date_range_type == 'last_n_days':
-        days = int(questionary.text(
-            'How many days to analyze?',
-            default='30',
-            validate=lambda val: val.isdigit() and int(val) > 0
-        ).ask())
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=days)
-        config['date_range'] = (start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
-    elif date_range_type == 'custom':
-        start_date = questionary.text(
-            'Enter start date (YYYY-MM-DD):',
-            validate=lambda val: _is_valid_date(val)
-        ).ask()
-        end_date = questionary.text(
-            'Enter end date (YYYY-MM-DD):',
-            validate=lambda val: _is_valid_date(val) and datetime.strptime(val, '%Y-%m-%d') >= datetime.strptime(
-                start_date, '%Y-%m-%d'),
-            validate_while_typing=False
-        ).ask()
-        config['date_range'] = (start_date, end_date)
-    elif date_range_type == 'random':
-        # Generate random period for testing
-        storage = DataStorage()
-        processor = DataProcessor()
-
-        total_days = int(questionary.text(
-            'Total days for random period:',
-            default='30',
-            validate=lambda val: val.isdigit() and int(val) > 0
-        ).ask())
-
-        # Get data date range to determine valid random period
-        try:
-            data_files = storage.find_latest_processed_data()
-            if config['timeframe'] in data_files:
-                data_file = data_files[config['timeframe']]
-                df = pd.read_csv(data_file, index_col=0, parse_dates=True)
-                min_date = df.index.min()
-                max_date = df.index.max()
-                date_range = (max_date - min_date).days
-
-                if date_range <= total_days:
-                    print(
-                        f"Warning: Requested random period ({total_days} days) is longer than available data ({date_range} days).")
-                    print(
-                        f"Using all available data instead: {min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}")
-                    config['date_range'] = (min_date.strftime('%Y-%m-%d'), max_date.strftime('%Y-%m-%d'))
-                else:
-                    # Generate random start date within available range
-                    from random import randint
-                    random_start_day = randint(0, date_range - total_days)
-                    random_start = min_date + timedelta(days=random_start_day)
-                    random_end = random_start + timedelta(days=total_days)
-                    config['date_range'] = (random_start.strftime('%Y-%m-%d'), random_end.strftime('%Y-%m-%d'))
-                    print(
-                        f"Random period selected: {random_start.strftime('%Y-%m-%d')} to {random_end.strftime('%Y-%m-%d')}")
-            else:
-                print(f"No data found for timeframe {config['timeframe']}. Using all available data.")
-                config['date_range'] = None
-        except Exception as e:
-            print(f"Error determining data range: {str(e)}. Using all available data.")
-            config['date_range'] = None
-
-    # Report path (always generate report)
-    config['generate_report'] = True
-    report_name = f"model_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
-    default_path = os.path.join(project_root, "analysis", report_name)
-
-    custom_path = questionary.confirm(
-        'Would you like to specify a custom path for the report?',
-        default=False
-    ).ask()
-
-    if custom_path:
-        config['report_path'] = questionary.text(
-            'Enter path for report file:',
-            default=default_path
-        ).ask()
-    else:
-        config['report_path'] = default_path
-
-    # Ensure report directory exists
-    report_dir = os.path.dirname(config['report_path'])
-    os.makedirs(report_dir, exist_ok=True)
-
-    return config
-
-
-def run_analysis(config):
-    """Run the complete analysis with the specified configuration."""
+    # Generate HTML report if report_generator exists
     try:
-        # If model path is not specified, select the latest model
-        storage = DataStorage()
-        processor = DataProcessor()
+        from debug_tools.report_generator_analyze_predictions import generate_html_report
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_name = f"prediction_analysis_{os.path.basename(model_path)}_{timestamp}.html"
+        report_dir = os.path.join(project_root, "analysis")
+        os.makedirs(report_dir, exist_ok=True)
+        report_path = os.path.join(report_dir, report_name)
+        generate_html_report(results, report_path)
+        logger.info(f"HTML report generated: {report_path}")
+        results['report_path'] = report_path
+    except ImportError:
+        logger.warning("Report generator module not found. No HTML report will be generated.")
+        results['report_path'] = None
 
-        if config['model_path'] is None:
-            models_dir = os.path.join(project_root, "data_output", "trained_models")
-            if os.path.exists(models_dir):
-                model_files = [f for f in os.listdir(models_dir) if
-                               f.endswith('.joblib') and not f.endswith('_random_forest.joblib')
-                               and not f.endswith('_xgboost.joblib')
-                               and not f.endswith('_metadata.pkl')]
-
-                if model_files:
-                    model_files.sort(key=lambda x: os.path.getctime(os.path.join(models_dir, x)), reverse=True)
-                    config['model_path'] = os.path.join(models_dir, model_files[0])
-                    logger.info(f"Using latest model: {model_files[0]}")
-                else:
-                    logger.error("No model files found")
-                    return False
-            else:
-                logger.error("Models directory not found")
-                return False
-
-        # Load model and data
-        model, model_info, data_info = load_model_and_data(
-            model_path=config['model_path'],
-            timeframe=config['timeframe'],
-            date_range=config['date_range']
-        )
-
-        if model is None:
-            logger.error("Failed to load model")
-            return False
-
-        if data_info is None:
-            logger.error("Failed to load data")
-            return False
-
-        df, horizon = data_info
-
-        # Generate predictions
-        predictions_df = generate_predictions(model, df, horizon)
-
-        if predictions_df is None or len(predictions_df) == 0:
-            logger.error("Failed to generate predictions")
-            return False
-
-        # Run analyses and collect results
-        results = {}
-        results['model_info'] = model_info
-        results['time_analysis'] = analyze_predictions_over_time(predictions_df, df)
-        results['accuracy_analysis'] = analyze_prediction_accuracy(predictions_df)
-        results['consecutive_analysis'] = analyze_consecutive_predictions(predictions_df)
-        results['price_analysis'] = analyze_price_movement_vs_prediction(predictions_df, df)
-        results['trading_opportunities'] = check_trading_opportunities(
-            predictions_df,
-            confidence_threshold=config['confidence_threshold']
-        )
-
-        # Generate HTML report
-        if config['generate_report'] and has_report_generator:
-            report_path = config['report_path']
-            try:
-                from debug_tools.report_generator_analyze_predictions import generate_html_report
-                generate_html_report(results, report_path)
-                logger.info(f"HTML report generated: {report_path}")
-                print(f"\nAnalysis complete! Report generated at: {report_path}")
-            except Exception as e:
-                logger.error(f"Error generating HTML report: {str(e)}")
-                print(f"\nError generating HTML report: {str(e)}")
-                return False
-        elif config['generate_report'] and not has_report_generator:
-            logger.error("Report generation requested but report_generator.py not found")
-            print("\nWarning: Report generation requested but report_generator.py not found.")
-            print("Please make sure report_generator.py is in the debug_tools directory.")
-            return False
-
-        return True
-
-    except Exception as e:
-        logger.error(f"Error during analysis: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        print(f"\nError during analysis: {str(e)}")
-        return False
-
-
-def main():
-    """Main function for the prediction analyzer."""
-    try:
-        # Show main menu and get configuration
-        config = main_menu()
-
-        # Run analysis with the selected configuration
-        success = run_analysis(config)
-
-        if not success:
-            print("\nAnalysis encountered errors. Please check the log file for details.")
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        print(f"\nUnexpected error: {str(e)}")
-
-
-if __name__ == "__main__":
-    main()
+    return results

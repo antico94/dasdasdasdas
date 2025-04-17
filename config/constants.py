@@ -59,6 +59,7 @@ class AppMode(Enum):
     LIVE_TRADE = "live_trade"
     OPTIMIZE = "optimize"
     VISUALIZE = "visualize"
+    ANALYZE_PREDICTIONS = "analyze_predictions"  # New mode
 
 
 # XAUUSD-specific constants

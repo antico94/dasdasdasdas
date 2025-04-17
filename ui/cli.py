@@ -15,6 +15,7 @@ class TradingBotCLI:
             Choice("Process Data", AppMode.PROCESS_DATA.value),
             Choice("Train Model", AppMode.TRAIN_MODEL.value),
             Choice("Backtest Strategy", AppMode.BACKTEST.value),
+            Choice("Analyze Predictions", AppMode.ANALYZE_PREDICTIONS.value),  # New option
             Choice("Live Trading", AppMode.LIVE_TRADE.value),
             Separator(),
             Choice("Optimize Hyperparameters", AppMode.OPTIMIZE.value),
@@ -620,6 +621,80 @@ class TradingBotCLI:
                 print(f"{key}: {value}")
 
         input("\nPress Enter to continue...")
+
+    def analyze_predictions_menu(self) -> Dict:
+        """Menu for prediction analysis options."""
+        model_choices = self._get_available_models()
+        if not model_choices:
+            print("\nNo models available for analysis. Please train a model first.")
+            return {'model_file': None}
+
+        default_config = {
+            'model_file': model_choices[0].value,
+            'timeframe': 'H1',
+            'confidence_threshold': 0.65,
+            'use_test_data': True,
+            'generate_report': True
+        }
+
+        print("\nCurrent Configuration:")
+        print(f"- Model: {os.path.basename(default_config['model_file'])}")
+        print(f"- Timeframe: {default_config['timeframe']}")
+        print(f"- Confidence threshold: {default_config['confidence_threshold']}")
+        print(f"- Data source: {'Test' if default_config['use_test_data'] else 'Validation'} data")
+        print(f"- Generate HTML report: {'Yes' if default_config['generate_report'] else 'No'}")
+
+        use_defaults = questionary.select(
+            'How would you like to proceed?',
+            choices=[
+                Choice('Run analysis with current configuration', 'use_defaults'),
+                Choice('Change configuration settings', 'change_config')
+            ]
+        ).ask()
+
+        if use_defaults == 'use_defaults':
+            return default_config
+
+        # Custom configuration
+        results = {}
+
+        results['model_file'] = questionary.select(
+            'Select model for analysis:',
+            choices=model_choices
+        ).ask()
+
+        results['timeframe'] = questionary.select(
+            'Select timeframe for analysis:',
+            choices=[
+                Choice('M5 (5 minutes)', 'M5'),
+                Choice('M15 (15 minutes)', 'M15'),
+                Choice('H1 (1 hour)', 'H1'),
+                Choice('D1 (Daily)', 'D1'),
+            ],
+            default=default_config['timeframe']
+        ).ask()
+
+        results['use_test_data'] = questionary.select(
+            'Select data source for analysis:',
+            choices=[
+                Choice('Test data', True),
+                Choice('Validation data', False),
+            ],
+            default=default_config['use_test_data']
+        ).ask()
+
+        results['confidence_threshold'] = float(questionary.text(
+            'Enter confidence threshold for trading opportunities (0.5-1.0):',
+            default=str(default_config['confidence_threshold']),
+            validate=lambda val: (val.replace('.', '', 1).isdigit() and 0.5 <= float(val) <= 1.0)
+        ).ask())
+
+        results['generate_report'] = questionary.confirm(
+            'Generate HTML report with visualizations?',
+            default=default_config['generate_report']
+        ).ask()
+
+        return results
 
 
 def main():

@@ -51,6 +51,8 @@ class TradingBotApp:
                 self._handle_train_model()
             elif action == AppMode.BACKTEST.value:
                 self._handle_backtest()
+            elif action == AppMode.ANALYZE_PREDICTIONS.value:  # New handler
+                self._handle_analyze_predictions()
             elif action == AppMode.LIVE_TRADE.value:
                 self._handle_live_trade()
             elif action == AppMode.OPTIMIZE.value:
@@ -516,6 +518,39 @@ class TradingBotApp:
                 opt_results,
                 title=f"Optimization Results - {os.path.basename(opt_path)}"
             )
+
+    def _handle_analyze_predictions(self):
+        """Handle prediction analysis action."""
+        from analysis.analyze_predictions import analyze_predictions
+
+        # Use existing CLI to get options
+        options = self.cli.analyze_predictions_menu()
+        logger.info("Prediction analysis options: %s", options)
+
+        if not self.cli.confirm_action("analyze model predictions"):
+            logger.info("User cancelled prediction analysis.")
+            return
+
+        try:
+            results = analyze_predictions(
+                model_path=options['model_file'],
+                timeframe=options['timeframe'],
+                date_range=options.get('date_range'),
+                use_test_data=options.get('use_test_data', True),
+                confidence_threshold=options['confidence_threshold']
+            )
+
+            self.cli.show_results("Prediction Analysis Complete", results['summary'])
+
+            # Optional: offer to view detailed report if generated
+            if options.get('generate_report') and 'report_path' in results:
+                if self.cli.confirm_action(f"open the generated report at {results['report_path']}"):
+                    import webbrowser
+                    webbrowser.open(f"file://{results['report_path']}")
+
+        except Exception as e:
+            logger.exception("Error during prediction analysis: %s", str(e))
+            self.cli.show_results("Error", {"Status": "Failed", "Error": str(e)})
 
 
 if __name__ == "__main__":
