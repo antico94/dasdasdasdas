@@ -96,8 +96,8 @@ class DataProcessor:
             # Binary classification: 1 for price up, 0 for price down
             price_change_pct = (df["close"].shift(-horizon) / df["close"] - 1) * 100
 
-            # FIXED: Increased minimum change threshold to 0.1% for gold
-            min_change_threshold = 0.1  # minimum change to consider (0.1%)
+            # Increased threshold for gold's volatility (from 0.1% to 0.2%)
+            min_change_threshold = 0.2  # More appropriate for gold price movements
 
             # Create target labels based on price movement
             df[f"target_{horizon}"] = np.where(
@@ -105,24 +105,33 @@ class DataProcessor:
                 np.where(price_change_pct < -min_change_threshold, 0, np.nan)
             )
 
-            # FIXED: Don't automatically use majority class, use previous direction or random
-            if df[f"target_{horizon}"].isna().any():
-                na_count = df[f"target_{horizon}"].isna().sum()
+            # Log the percentage of insignificant movements
+            na_count = df[f"target_{horizon}"].isna().sum()
+            if na_count > 0:
                 self.logger.info(
-                    f"Found {na_count} ({na_count / len(df) * 100:.2f}%) rows with insignificant movements")
+                    f"Found {na_count} ({na_count / len(df) * 100:.2f}%) rows with insignificant movements"
+                )
 
-                # First count non-NaN values to see if we have a balanced dataset
-                class_counts = df[f"target_{horizon}"].value_counts()
-                self.logger.info(f"Current class distribution: {class_counts}")
+                # Instead of random filling, use trend continuation (previous value)
+                # This maintains the temporal consistency of the data
+                df[f"target_{horizon}"] = df[f"target_{horizon}"].fillna(method='ffill')
 
-                # Fill NaN values using a more balanced approach
-                nan_indices = df[f"target_{horizon}"].isna()
+                # For any remaining NaNs at the beginning, use the next available value
+                df[f"target_{horizon}"] = df[f"target_{horizon}"].fillna(method='bfill')
 
-                # Option 1: Use a 50/50 split for insignificant moves (random)
-                rand_values = np.random.choice([0, 1], size=na_count)
-                df.loc[nan_indices, f"target_{horizon}"] = rand_values
+                # If there are still NaNs, use balanced class distribution
+                if df[f"target_{horizon}"].isna().any():
+                    # Get current class distribution for balancing
+                    class_counts = df[f"target_{horizon}"].value_counts(normalize=True)
+                    if len(class_counts) == 2:
+                        # Fill remaining NaNs with the minority class to improve balance
+                        minority_class = 0 if class_counts.get(0, 0) < class_counts.get(1, 0) else 1
+                        df[f"target_{horizon}"] = df[f"target_{horizon}"].fillna(minority_class)
+                    else:
+                        # Default to 0 if we can't determine distribution
+                        df[f"target_{horizon}"] = df[f"target_{horizon}"].fillna(0)
 
-                self.logger.info(f"Filled insignificant movements with balanced random values (50/50 split)")
+                self.logger.info(f"Filled insignificant movements using trend continuation and balancing")
 
             df[f"target_{horizon}"] = df[f"target_{horizon}"].astype(int)
 
@@ -130,6 +139,14 @@ class DataProcessor:
             up_pct = df[f"target_{horizon}"].mean() * 100
             self.logger.info(f"Target variable distribution: {up_pct:.2f}% up, {100 - up_pct:.2f}% down")
             self.logger.info(f"Total samples for training: {len(df)}")
+
+            # Add a warning if the class distribution is highly imbalanced
+            if up_pct < 30 or up_pct > 70:
+                self.logger.warning(
+                    f"Highly imbalanced class distribution detected: {up_pct:.2f}% up, {100 - up_pct:.2f}% down. "
+                    f"Consider adjusting the threshold or implementing class weights during training."
+                )
+
         elif target_type == "return":
             df[f"target_{horizon}"] = (df["close"].shift(-horizon) / df["close"] - 1) * 100
         elif target_type == "price":
@@ -452,7 +469,7 @@ class DataProcessor:
 
 
     def save_processed_split_data(self, split_data: Dict[str, Dict[str, pd.DataFrame]], suffix: str = "processed") -> \
-    Dict[str, Dict[str, str]]:
+            Dict[str, Dict[str, str]]:
         """Save processed train, validation and test data to separate directories."""
         symbol = self.config["data"]["symbol"]
         saved_paths = {"train": {}, "validation": {}, "test": {}}

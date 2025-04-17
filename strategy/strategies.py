@@ -86,17 +86,6 @@ class GoldTrendStrategy(Strategy):
 
     def __init__(self, config: Dict):
         super().__init__(config)
-
-        # Entry parameters
-        self.entry_confidence_threshold = config.get('strategy', {}).get('min_confidence', 0.65)
-        self.use_contrarian_entries = config.get('strategy', {}).get('contrarian_entries', False)
-
-        # Exit parameters - from parent class
-        # self.take_profit_pct already set in parent
-        # self.stop_loss_pct already set in parent
-        # self.trailing_stop_pct already set in parent
-        # self.max_hold_hours already set in parent
-
         self.use_trailing_stop = config.get('strategy', {}).get('use_trailing_stop', True)
 
         # Partial profit taking
@@ -111,6 +100,15 @@ class GoldTrendStrategy(Strategy):
         # Gold-specific parameters
         self.gold_price_levels = config.get('gold', {}).get('psychological_levels',
                                                             [1800, 1850, 1900, 1950, 2000, 2050, 2100, 2150, 2200])
+        self.entry_confidence_threshold = config.get('strategy', {}).get('min_confidence', 0.65)
+        self.use_contrarian_entries = config.get('strategy', {}).get('contrarian_entries', False)
+
+        # Exit parameters - from parent class
+        # Update take profit to improve risk-reward ratio
+        self.take_profit_pct = config.get('strategy', {}).get('take_profit_pct', 1.5)  # Increased from 1.0 to 1.5
+        self.stop_loss_pct = config.get('strategy', {}).get('stop_loss_pct', 0.5)
+        self.trailing_stop_pct = config.get('strategy', {}).get('trailing_stop_pct', 0.3)
+        self.max_hold_hours = config.get('strategy', {}).get('max_hold_hours', 48)
 
         # Additional tracking for diagnostics
         self.tracking = {
@@ -153,35 +151,86 @@ class GoldTrendStrategy(Strategy):
                 avg_up_prob = up_probs.mean()
                 self.logger.info(f"Average UP probability: {avg_up_prob:.4f}")
 
-                if avg_up_prob > 0.8 or avg_up_prob < 0.2:
+                if avg_up_prob > 0.7 or avg_up_prob < 0.3:
                     is_biased = True
-                    bias_direction = "UP" if avg_up_prob > 0.8 else "DOWN"
+                    bias_direction = "UP" if avg_up_prob > 0.7 else "DOWN"
                     self.logger.warning(
-                        f"Model appears strongly biased towards {bias_direction}: avg prob={avg_up_prob:.4f}")
+                        f"Model appears biased towards {bias_direction}: avg prob={avg_up_prob:.4f}")
 
         # Initialize signal column
         results['signal'] = SignalType.HOLD.value
 
-        # Modified signal generation logic to handle potential model bias
+        # FIXED: Use symmetrical thresholds for buy/sell decisions
         if 'pred_probability_up' in results.columns and 'pred_probability_down' in results.columns:
-            if is_biased and self.use_contrarian_entries:
-                self.logger.info("Using contrarian entry logic due to model bias")
-                # Higher UP probability = SELL signal (contrarian)
-                sell_mask = results['pred_probability_up'] >= 0.7
-                buy_mask = results['pred_probability_up'] <= 0.3
-            else:
-                # Use a more balanced threshold for entries
-                # For uptrend bias, increase UP threshold and lower DOWN threshold
-                up_threshold = 0.7  # Higher threshold for UP signals
-                down_threshold = 0.6  # Lower threshold for DOWN signals
+            confidence_threshold = self.entry_confidence_threshold  # Use the strategy's confidence threshold
 
-                buy_mask = results['pred_probability_up'] >= up_threshold
-                sell_mask = results['pred_probability_down'] >= down_threshold
+            if is_biased and self.use_contrarian_entries:
+                self.logger.info(f"Using contrarian entry logic due to {bias_direction} bias")
+                if bias_direction == "UP":
+                    # If model has UP bias, use contrarian logic for strong UP predictions
+                    sell_mask = results[
+                                    'pred_probability_up'] >= confidence_threshold + 0.1  # Stronger threshold for contrarian
+                    buy_mask = results['pred_probability_up'] <= 0.5 - 0.1  # Weaker threshold
+                else:  # DOWN bias
+                    # If model has DOWN bias, use contrarian logic for strong DOWN predictions
+                    buy_mask = results[
+                                   'pred_probability_down'] >= confidence_threshold + 0.1  # Stronger threshold for contrarian
+                    sell_mask = results['pred_probability_down'] <= 0.5 - 0.1  # Weaker threshold
+            else:
+                # No bias or not using contrarian - use standard logic with equal thresholds
+                buy_mask = results['pred_probability_up'] >= confidence_threshold
+                sell_mask = results['pred_probability_down'] >= confidence_threshold
 
             results.loc[buy_mask, 'signal'] = SignalType.BUY.value
             results.loc[sell_mask, 'signal'] = SignalType.SELL.value
 
             self.logger.info(f"Generated {buy_mask.sum()} BUY and {sell_mask.sum()} SELL signals")
+
+        # Add market regime awareness
+        if 'close' in results.columns:
+            # Calculate short and long-term trend directions
+            results['short_ema'] = results['close'].ewm(span=8).mean() if 'short_ema' not in results.columns else \
+            results['short_ema']
+            results['long_ema'] = results['close'].ewm(span=21).mean() if 'long_ema' not in results.columns else \
+            results['long_ema']
+            results['trend_direction'] = np.where(results['short_ema'] > results['long_ema'], 1, -1)
+
+            # Only generate signals that align with the overall trend
+            trend_filter = self.config.get('strategy', {}).get('trend_filter', True)
+            if trend_filter:
+                # In uptrend, only take BUY signals
+                uptrend_mask = results['trend_direction'] == 1
+                results.loc[
+                    uptrend_mask & (results['signal'] == SignalType.SELL.value), 'signal'] = SignalType.HOLD.value
+
+                # In downtrend, only take SELL signals
+                downtrend_mask = results['trend_direction'] == -1
+                results.loc[
+                    downtrend_mask & (results['signal'] == SignalType.BUY.value), 'signal'] = SignalType.HOLD.value
+
+                filtered_buys = (results['signal'] == SignalType.BUY.value).sum()
+                filtered_sells = (results['signal'] == SignalType.SELL.value).sum()
+                self.logger.info(f"After trend filtering: {filtered_buys} BUY and {filtered_sells} SELL signals")
+
+        # Filter signals based on volume
+        if 'tick_volume' in results.columns:
+            # Calculate relative volume (compared to recent average)
+            results['rel_volume'] = results['tick_volume'] / results['tick_volume'].rolling(24).mean()
+
+            # Only take signals when volume is above average
+            volume_threshold = 1.2  # 20% above average
+            volume_filter = self.config.get('strategy', {}).get('volume_filter',
+                                                                False)  # Default to False to avoid breaking existing configs
+
+            if volume_filter:
+                high_volume_mask = results['rel_volume'] >= volume_threshold
+
+                # Filter signals on low volume
+                results.loc[(~high_volume_mask) & (
+                            results['signal'] != SignalType.HOLD.value), 'signal'] = SignalType.HOLD.value
+
+                remaining_signals = (results['signal'] != SignalType.HOLD.value).sum()
+                self.logger.info(f"After volume filtering: {remaining_signals} signals remain")
 
         # Additional Gold-specific filters
         # 1. Avoid trading during major economic releases (if data available)

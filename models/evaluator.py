@@ -121,21 +121,23 @@ def backtest_model_with_strategy(
         try:
             y_pred_proba = model.predict_proba(X_test)
             if y_pred_proba.shape[1] == 2:
-                positive_probs = y_pred_proba[:, 1]  # Probability for class 1 (UP)
-                model_predictions['pred_probability_up'] = positive_probs
-                model_predictions['pred_probability_down'] = 1 - positive_probs
+                # FIXED: Directly use model's output probabilities without transformation
+                model_predictions['pred_probability_up'] = y_pred_proba[:, 1]  # Class 1 (UP)
+                model_predictions['pred_probability_down'] = y_pred_proba[:, 0]  # Class 0 (DOWN)
 
-                # Log probability distribution
-                prob_bins = np.linspace(0, 1, 11)
-                hist, _ = np.histogram(positive_probs, bins=prob_bins)
-                bin_centers = (prob_bins[:-1] + prob_bins[1:]) / 2
+                # Log probability distribution for debugging
+                up_probs = y_pred_proba[:, 1]
+                logger.info(
+                    f"UP probability stats: min={up_probs.min():.4f}, max={up_probs.max():.4f}, mean={up_probs.mean():.4f}")
+                down_probs = y_pred_proba[:, 0]
+                logger.info(
+                    f"DOWN probability stats: min={down_probs.min():.4f}, max={down_probs.max():.4f}, mean={down_probs.mean():.4f}")
 
-                logger.info("Prediction probability distribution:")
-                for center, count in zip(bin_centers, hist):
-                    logger.info(f"  {center:.1f}: {count} predictions ({count / len(positive_probs) * 100:.1f}%)")
-                logger.info(f"Min probability: {positive_probs.min():.4f}")
-                logger.info(f"Max probability: {positive_probs.max():.4f}")
-                logger.info(f"Mean probability: {positive_probs.mean():.4f}")
+                # Sanity check - probabilities should sum to approximately 1
+                prob_sum = up_probs + down_probs
+                if abs(prob_sum.mean() - 1.0) > 0.01:
+                    logger.warning(
+                        f"Probabilities don't sum to 1.0 (mean={prob_sum.mean():.4f}) - possible interpretation issue")
         except Exception as e:
             logger.error(f"Error generating prediction probabilities: {str(e)}")
     else:
