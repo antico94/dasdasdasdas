@@ -688,6 +688,17 @@ def train_model(X_train: pd.DataFrame, y_train: pd.Series, X_val: pd.DataFrame, 
     use_optimized_params = hyperparameter_tuning and config.get("model", {}).get("use_bayes_optimizer", False)
     use_cross_validation = config.get("model", {}).get("cross_validation", False)
 
+    # Add class distribution logging
+    y_train_dist = y_train.value_counts(normalize=True)
+    y_val_dist = y_val.value_counts(normalize=True)
+
+    logger.info(f"Training class distribution: {y_train_dist.to_dict()}")
+    logger.info(f"Validation class distribution: {y_val_dist.to_dict()}")
+    logger.info(f"Training with model_type: {model_type}")
+    logger.info(f"hyperparameter_tuning: {hyperparameter_tuning}")
+    logger.info(f"use_optimized_params: {use_optimized_params}")
+    logger.info(f"use_cross_validation: {use_cross_validation}")
+    logger.info(f"random_seed: {random_seed}")
     logger.info(f"Training {model_type} model with settings:")
     logger.info(f"  hyperparameter_tuning: {hyperparameter_tuning}")
     logger.info(f"  use_optimized_params: {use_optimized_params}")

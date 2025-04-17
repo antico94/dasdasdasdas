@@ -95,21 +95,38 @@ class DataProcessor:
         if target_type == "direction":
             # Binary classification: 1 for price up, 0 for price down
             price_change_pct = (df["close"].shift(-horizon) / df["close"] - 1) * 100
-            min_change_threshold = 0.05  # minimum change to consider (0.05%)
+
+            # FIXED: Increased minimum change threshold to 0.1% for gold
+            min_change_threshold = 0.1  # minimum change to consider (0.1%)
+
+            # Create target labels based on price movement
             df[f"target_{horizon}"] = np.where(
                 price_change_pct > min_change_threshold, 1,
                 np.where(price_change_pct < -min_change_threshold, 0, np.nan)
             )
-            # Fill NaN values (insignificant moves) with the majority class
+
+            # FIXED: Don't automatically use majority class, use previous direction or random
             if df[f"target_{horizon}"].isna().any():
                 na_count = df[f"target_{horizon}"].isna().sum()
                 self.logger.info(
                     f"Found {na_count} ({na_count / len(df) * 100:.2f}%) rows with insignificant movements")
-                majority_class = df[f"target_{horizon}"].value_counts().idxmax() if not df[
-                    f"target_{horizon}"].isna().all() else 1
-                self.logger.info(f"Filling insignificant movements with majority class: {majority_class}")
-                df[f"target_{horizon}"] = df[f"target_{horizon}"].fillna(majority_class)
+
+                # First count non-NaN values to see if we have a balanced dataset
+                class_counts = df[f"target_{horizon}"].value_counts()
+                self.logger.info(f"Current class distribution: {class_counts}")
+
+                # Fill NaN values using a more balanced approach
+                nan_indices = df[f"target_{horizon}"].isna()
+
+                # Option 1: Use a 50/50 split for insignificant moves (random)
+                rand_values = np.random.choice([0, 1], size=na_count)
+                df.loc[nan_indices, f"target_{horizon}"] = rand_values
+
+                self.logger.info(f"Filled insignificant movements with balanced random values (50/50 split)")
+
             df[f"target_{horizon}"] = df[f"target_{horizon}"].astype(int)
+
+            # Log the final class distribution
             up_pct = df[f"target_{horizon}"].mean() * 100
             self.logger.info(f"Target variable distribution: {up_pct:.2f}% up, {100 - up_pct:.2f}% down")
             self.logger.info(f"Total samples for training: {len(df)}")

@@ -146,39 +146,42 @@ class GoldTrendStrategy(Strategy):
 
         # Determine if model is biased (all predictions favor one class)
         is_biased = False
+        bias_direction = None
         if 'pred_probability_up' in results.columns:
             up_probs = results['pred_probability_up'].dropna()
             if len(up_probs) > 0:
-                if up_probs.min() > 0.5 or up_probs.max() < 0.5:
+                avg_up_prob = up_probs.mean()
+                self.logger.info(f"Average UP probability: {avg_up_prob:.4f}")
+
+                if avg_up_prob > 0.8 or avg_up_prob < 0.2:
                     is_biased = True
+                    bias_direction = "UP" if avg_up_prob > 0.8 else "DOWN"
                     self.logger.warning(
-                        f"Model appears biased: min prob={up_probs.min():.4f}, max prob={up_probs.max():.4f}")
+                        f"Model appears strongly biased towards {bias_direction}: avg prob={avg_up_prob:.4f}")
 
         # Initialize signal column
         results['signal'] = SignalType.HOLD.value
 
-        # Generate entry signals
-        if is_biased and self.use_contrarian_entries:
-            self.logger.info("Using contrarian entry logic due to model bias")
-            if 'pred_probability_up' in results.columns:
+        # Modified signal generation logic to handle potential model bias
+        if 'pred_probability_up' in results.columns and 'pred_probability_down' in results.columns:
+            if is_biased and self.use_contrarian_entries:
+                self.logger.info("Using contrarian entry logic due to model bias")
                 # Higher UP probability = SELL signal (contrarian)
                 sell_mask = results['pred_probability_up'] >= 0.7
                 buy_mask = results['pred_probability_up'] <= 0.3
+            else:
+                # Use a more balanced threshold for entries
+                # For uptrend bias, increase UP threshold and lower DOWN threshold
+                up_threshold = 0.7  # Higher threshold for UP signals
+                down_threshold = 0.6  # Lower threshold for DOWN signals
 
-                results.loc[buy_mask, 'signal'] = SignalType.BUY.value
-                results.loc[sell_mask, 'signal'] = SignalType.SELL.value
+                buy_mask = results['pred_probability_up'] >= up_threshold
+                sell_mask = results['pred_probability_down'] >= down_threshold
 
-                self.logger.info(f"Generated {buy_mask.sum()} BUY and {sell_mask.sum()} SELL signals (contrarian)")
-        else:
-            # Standard signal generation
-            if 'pred_probability_up' in results.columns and 'pred_probability_down' in results.columns:
-                buy_mask = results['pred_probability_up'] >= self.entry_confidence_threshold
-                sell_mask = results['pred_probability_down'] >= self.entry_confidence_threshold
+            results.loc[buy_mask, 'signal'] = SignalType.BUY.value
+            results.loc[sell_mask, 'signal'] = SignalType.SELL.value
 
-                results.loc[buy_mask, 'signal'] = SignalType.BUY.value
-                results.loc[sell_mask, 'signal'] = SignalType.SELL.value
-
-                self.logger.info(f"Generated {buy_mask.sum()} BUY and {sell_mask.sum()} SELL signals")
+            self.logger.info(f"Generated {buy_mask.sum()} BUY and {sell_mask.sum()} SELL signals")
 
         # Additional Gold-specific filters
         # 1. Avoid trading during major economic releases (if data available)

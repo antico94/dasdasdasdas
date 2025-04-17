@@ -27,7 +27,8 @@ class RandomForestModel(BaseModel):
             'max_features': 'sqrt' if self.is_classifier else 'auto',
             'random_state': 42,
             'n_jobs': -1,
-            'class_weight': 'balanced' if self.is_classifier else None
+            'class_weight': 'balanced_subsample' if self.is_classifier else None
+            # CHANGED from 'balanced' to 'balanced_subsample'
         }
 
         # Update with user-provided hyperparameters if available

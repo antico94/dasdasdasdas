@@ -169,8 +169,11 @@ def generate_predictions(model, df, horizon=1):
         X, y = processor.prepare_ml_features(df, horizon=horizon)
         logger.info(f"Prepared features shape: {X.shape}, target shape: {y.shape}")
 
-        # Debug: Print raw class distribution
-        logger.info(f"Actual class distribution: {y.value_counts(normalize=True)}")
+        # Debug: Print class distribution
+        actual_class_dist = y.value_counts(normalize=True)
+        logger.info(f"Actual class distribution in test data: {actual_class_dist}")
+        logger.info(f"Class 1 (UP) proportion: {actual_class_dist.get(1, 0):.4f}")
+        logger.info(f"Class 0 (DOWN) proportion: {actual_class_dist.get(0, 0):.4f}")
 
         # Get expected features from model metadata
         expected_features = []
@@ -206,8 +209,10 @@ def generate_predictions(model, df, horizon=1):
         y_pred = model.predict(X)
 
         # Debug: Print prediction distribution
-        unique_preds, counts = np.unique(y_pred, return_counts=True)
-        logger.info(f"Prediction distribution: {dict(zip(unique_preds, counts))}")
+        pred_class_dist = pd.Series(y_pred).value_counts(normalize=True)
+        logger.info(f"Prediction distribution: {pred_class_dist}")
+        logger.info(f"Class 1 (UP) predictions: {pred_class_dist.get(1, 0):.4f}")
+        logger.info(f"Class 0 (DOWN) predictions: {pred_class_dist.get(0, 0):.4f}")
 
         # Get probabilities if available
         if hasattr(model, 'predict_proba'):
@@ -685,16 +690,14 @@ def analyze_predictions(model_path: str, timeframe: str = 'H1', date_range: Opti
         return {'error': 'Failed to generate predictions'}
 
     # Run analyses and collect results
-    results = {}
-    results['model_info'] = model_info
-    results['time_analysis'] = analyze_predictions_over_time(predictions_df, df)
-    results['accuracy_analysis'] = analyze_prediction_accuracy(predictions_df)
-    results['consecutive_analysis'] = analyze_consecutive_predictions(predictions_df)
-    results['price_analysis'] = analyze_price_movement_vs_prediction(predictions_df, df)
-    results['trading_opportunities'] = check_trading_opportunities(
-        predictions_df,
-        confidence_threshold=confidence_threshold
-    )
+    results = {'model_info': model_info, 'time_analysis': analyze_predictions_over_time(predictions_df, df),
+               'accuracy_analysis': analyze_prediction_accuracy(predictions_df),
+               'consecutive_analysis': analyze_consecutive_predictions(predictions_df),
+               'price_analysis': analyze_price_movement_vs_prediction(predictions_df, df),
+               'trading_opportunities': check_trading_opportunities(
+                   predictions_df,
+                   confidence_threshold=confidence_threshold
+               )}
 
     # Create summary statistics
     summary = {
